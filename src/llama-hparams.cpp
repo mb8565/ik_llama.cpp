@@ -1580,6 +1580,13 @@ void llm_load_hparams(
             {
                 ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,     hparams.n_ff_exp);
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,    hparams.f_norm_rms_eps);
+                // The DSA lightning indexer normalizes its key with a plain LayerNorm
+                // (indexer_k_norm, LLM_NORM), which uses f_norm_eps. The converter does not store a
+                // separate indexer-norm eps, so f_norm_eps stays 0; the CPU LayerNorm kernel asserts
+                // eps > 0 (the CUDA kernel tolerates 0), so --dsa aborts on CPU-only builds. Load it
+                // if present, else fall back to the model's norm eps.
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_EPS,        hparams.f_norm_eps, false);
+                if (hparams.f_norm_eps <= 0.0f) hparams.f_norm_eps = hparams.f_norm_rms_eps;
                 ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS, hparams.rope_sections, 4, false);
 
                 // MoE parameters

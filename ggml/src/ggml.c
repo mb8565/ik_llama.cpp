@@ -14974,7 +14974,6 @@ static void ggml_compute_forward_concat_any(
     GGML_ASSERT(src0->type == src1->type && src0->type == dst->type);
 
     const int32_t dim = ggml_get_op_params_i32(dst, 0);
-    // Let's do it for dim = 0 only for now
     GGML_ASSERT(dim == 0);
 
     int ith = params->ith;
@@ -19007,6 +19006,11 @@ static void ggml_compute_forward_set_rows_f32(
     const int64_t ir1 = MIN(ir0 + dr, nr);
 
     ggml_from_float_t const from_float = type_traits[dst->type].from_float;
+    // An F32 dst has no from_float trait (it is NULL): this CPU set_rows kernel was written for a
+    // quantized / F16 dst (the KV-cache use case) and dereferenced a NULL from_float on the F32 dst
+    // that the GLM-DSA sparse-mask scatter uses, segfaulting CPU-only (-ngl 0). CUDA already handled
+    // F32 dst. When dst is F32 the row copy is a plain float memcpy.
+    const bool dst_f32 = (dst->type == GGML_TYPE_F32);
 
     if (src1->type == GGML_TYPE_I64) {
         for (int64_t i03 = 0; i03 < ne03; ++i03) {
@@ -19020,8 +19024,12 @@ static void ggml_compute_forward_set_rows_f32(
 
                     GGML_ASSERT(i1 >= 0 && i1 < ne1);
 
-                    from_float((const float *) ((char *) src0->data +  i*nb01 + i02*nb02 + i03*nb03),
-                            ((char *)  dst->data + i1*nb1  + i02*nb2  + i03*nb3), nc);
+                    {
+                        const float * s_row = (const float *) ((char *) src0->data + i*nb01 + i02*nb02 + i03*nb03);
+                        char * d_row = (char *) dst->data + i1*nb1 + i02*nb2 + i03*nb3;
+                        if (dst_f32) memcpy(d_row, s_row, nc*sizeof(float));
+                        else         from_float(s_row, d_row, nc);
+                    }
                 }
             }
         }
@@ -19038,8 +19046,12 @@ static void ggml_compute_forward_set_rows_f32(
 
                     GGML_ASSERT(i1 >= 0 && i1 < ne1);
 
-                    from_float((const float *) ((char *) src0->data +  i*nb01 + i02*nb02 + i03*nb03),
-                            ((char *)  dst->data + i1*nb1  + i02*nb2  + i03*nb3), nc);
+                    {
+                        const float * s_row = (const float *) ((char *) src0->data + i*nb01 + i02*nb02 + i03*nb03);
+                        char * d_row = (char *) dst->data + i1*nb1 + i02*nb2 + i03*nb3;
+                        if (dst_f32) memcpy(d_row, s_row, nc*sizeof(float));
+                        else         from_float(s_row, d_row, nc);
+                    }
                 }
             }
         }
