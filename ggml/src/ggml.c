@@ -19007,6 +19007,10 @@ static void ggml_compute_forward_set_rows_f32(
     const int64_t ir1 = MIN(ir0 + dr, nr);
 
     ggml_from_float_t const from_float = type_traits[dst->type].from_float;
+    // F32 destination has no from_float (type_traits[F32].from_float == NULL). The GLM-DSA sparse
+    // mask scatters into an F32 base via set_rows; without this guard the NULL from_float is called
+    // (segfault at ip=0 on CPU). CUDA has a real F32 set_rows path, so this only bit the CPU build.
+    const bool dst_is_f32 = (dst->type == GGML_TYPE_F32);
 
     if (src1->type == GGML_TYPE_I64) {
         for (int64_t i03 = 0; i03 < ne03; ++i03) {
@@ -19020,8 +19024,15 @@ static void ggml_compute_forward_set_rows_f32(
 
                     GGML_ASSERT(i1 >= 0 && i1 < ne1);
 
-                    from_float((const float *) ((char *) src0->data +  i*nb01 + i02*nb02 + i03*nb03),
-                            ((char *)  dst->data + i1*nb1  + i02*nb2  + i03*nb3), nc);
+                    {
+                        const float * src_row = (const float *) ((char *) src0->data +  i*nb01 + i02*nb02 + i03*nb03);
+                        char * dst_row = ((char *)  dst->data + i1*nb1  + i02*nb2  + i03*nb3);
+                        if (dst_is_f32) {
+                            memcpy(dst_row, src_row, nc*sizeof(float));
+                        } else {
+                            from_float(src_row, dst_row, nc);
+                        }
+                    }
                 }
             }
         }
@@ -19038,8 +19049,15 @@ static void ggml_compute_forward_set_rows_f32(
 
                     GGML_ASSERT(i1 >= 0 && i1 < ne1);
 
-                    from_float((const float *) ((char *) src0->data +  i*nb01 + i02*nb02 + i03*nb03),
-                            ((char *)  dst->data + i1*nb1  + i02*nb2  + i03*nb3), nc);
+                    {
+                        const float * src_row = (const float *) ((char *) src0->data +  i*nb01 + i02*nb02 + i03*nb03);
+                        char * dst_row = ((char *)  dst->data + i1*nb1  + i02*nb2  + i03*nb3);
+                        if (dst_is_f32) {
+                            memcpy(dst_row, src_row, nc*sizeof(float));
+                        } else {
+                            from_float(src_row, dst_row, nc);
+                        }
+                    }
                 }
             }
         }
