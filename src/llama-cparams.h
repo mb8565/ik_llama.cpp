@@ -32,6 +32,8 @@ struct llama_cparams {
     bool offload_kqv;
     bool flash_attn;
     int  mla_attn;
+    bool msa = false;      // enable MiniMax-M3 sparse attention (off by default; opt-in via --msa)
+    int  msa_top_k = -1;   // MSA top-k blocks override (<0 => use the model's configured topk_blocks)
     int  attn_max_batch;
     bool fused_moe_up_gate;
     bool grouped_expert_routing;

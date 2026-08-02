@@ -1948,6 +1948,15 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.dsa_top_k = std::stoi(argv[i]);
         return true;
     }
+    if (arg == "-msa" || arg == "--msa") {
+        params.msa = true;
+        return true;
+    }
+    if (arg == "-msatk" || arg == "--msa-top-k") {
+        CHECK_ARG
+        params.msa_top_k = std::stoi(argv[i]);
+        return true;
+    }
     if (arg == "-amb" || arg == "--attention-max-batch") {
         CHECK_ARG
         params.attn_max_batch = std::stoi(argv[i]);
@@ -3079,6 +3088,8 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-fidx,  --fused-indexer-topk",  "enable the fused indexer topk op (DSA only; default: %s)", params.fused_idx_topk ? "enabled" : "disabled" });
     options.push_back({ "*",           "        --swa-compress",         "allocate sliding-window layers at window size instead of n_ctx (default: %s)", params.swa_compress ? "enabled" : "disabled" });
     options.push_back({ "*",           "-dsatk, --dsa-top-k",           "DSA top-k override; <0 uses the model's configured indexer_top_k (default: %d)", params.dsa_top_k });
+    options.push_back({ "*",           "-msa,  --msa",                  "enable MiniMax-M3 sparse attention (MINIMAX-M3 arch only; default: %s)", params.msa ? "enabled" : "disabled" });
+    options.push_back({ "*",           "-msatk, --msa-top-k",           "MSA top-k blocks override; <0 uses the model's configured topk_blocks (default: %d)", params.msa_top_k });
     options.push_back({ "*",           "-amb,  --attention-max-batch",  "max batch size for attention computations (default: %d)", params.attn_max_batch});
     options.push_back({ "*",           "-no-fmoe, --no-fused-moe",      "disable fused MoE (default: %s)", params.fused_moe_up_gate ? "enabled" : "disabled" });
     options.push_back({ "*",           "-ger,  --grouped-expert-routing", "enable grouped expert routing (default: %s)", params.grouped_expert_routing ? "enabled" : "disabled" });
@@ -4354,6 +4365,8 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.offload_kqv       = !params.no_kv_offload;
     cparams.flash_attn        = params.flash_attn;
     cparams.mla_attn          = params.mla_attn;
+    cparams.msa               = params.msa;
+    cparams.msa_top_k         = params.msa_top_k;
     cparams.attn_max_batch    = params.attn_max_batch;
     cparams.fused_moe_up_gate = params.fused_moe_up_gate;
     cparams.grouped_expert_routing = params.grouped_expert_routing;

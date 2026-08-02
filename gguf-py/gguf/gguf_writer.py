@@ -661,6 +661,19 @@ class GGUFWriter:
     def add_leading_dense_block_count(self, length: int) -> None:
         self.add_uint32(Keys.LLM.LEADING_DENSE_BLOCK_COUNT.format(arch=self.arch), length)
 
+    # MiniMax-M3 MSA (block-sparse attention) indexer hparams
+    def add_sparse_index_dim(self, value: int) -> None:
+        self.add_uint32(Keys.Attention.SPARSE_INDEX_DIM.format(arch=self.arch), value)
+
+    def add_sparse_index_head_count(self, value: int) -> None:
+        self.add_uint32(Keys.Attention.SPARSE_INDEX_HEAD_COUNT.format(arch=self.arch), value)
+
+    def add_sparse_topk_blocks(self, value: int) -> None:
+        self.add_uint32(Keys.Attention.SPARSE_TOPK_BLOCKS.format(arch=self.arch), value)
+
+    def add_sparse_block_size(self, value: int) -> None:
+        self.add_uint32(Keys.Attention.SPARSE_BLOCK_SIZE.format(arch=self.arch), value)
+
     def add_feed_forward_length(self, length: int | Sequence[int]) -> None:
         if isinstance(length, int):
             self.add_uint32(Keys.LLM.FEED_FORWARD_LENGTH.format(arch=self.arch), length)

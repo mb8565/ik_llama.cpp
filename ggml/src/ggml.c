@@ -9272,9 +9272,16 @@ static struct ggml_tensor * ggml_soft_max_impl(
     if (mask) {
         GGML_ASSERT(mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32);
         GGML_ASSERT(ggml_is_contiguous(mask));
-        GGML_ASSERT(ggml_is_matrix(mask));
+        // Allow a per-head (or per-GQA-group) mask plane on ne[2]/ne[3] in addition to the usual
+        // 2D matrix mask. The CPU soft_max kernel broadcasts with i12 = i02 % ne12 and
+        // i13 = i03 % ne13, so any ne[2]/ne[3] dividing the corresponding a-dim is valid. A 2D
+        // mask (ne2==ne3==1) is the dense case. Used by MiniMax-M3 MSA per-GQA-group selection.
+        // Both the CPU and CUDA soft_max kernels honour the per-head ne[2] plane (CUDA via
+        // i12 = i02 % p.ne12, nb12 indexing); flash-attn is wired for it too.
         GGML_ASSERT(mask->ne[0] == a->ne[0]);
         GGML_ASSERT(mask->ne[1] >= a->ne[1]);
+        GGML_ASSERT(a->ne[2] % mask->ne[2] == 0);
+        GGML_ASSERT(a->ne[3] % mask->ne[3] == 0);
     }
 
     if (max_bias > 0.0f) {
@@ -10847,7 +10854,9 @@ struct ggml_tensor * ggml_flash_attn_ext(
 
     if (mask) {
         //GGML_ASSERT(ggml_is_contiguous(mask));
-        GGML_ASSERT(mask->ne[2] == 1);
+        // ne[2]==1 is the dense case. A mask whose ne[2] divides q->ne[2] gives one plane per
+        // GQA group, broadcast as i12 = i02 % ne12 to match soft_max. Used by MiniMax-M3 MSA.
+        GGML_ASSERT(mask->ne[2] == 1 || q->ne[2] % mask->ne[2] == 0);
         GGML_ASSERT(mask->ne[3] == 1);
         GGML_ASSERT(mask->ne[1] >= GGML_PAD(q->ne[1], GGML_KQ_MASK_PAD) &&
                 "the Flash-Attention kernel requires the mask to be padded to GGML_KQ_MASK_PAD and at least n_queries big");
@@ -20183,7 +20192,8 @@ static void ggml_compute_forward_set_rows_f32(
     ggml_from_float_t const from_float = type_traits[dst->type].from_float;
     // F32 has no from_float entry in type_traits (it is NULL), so set_rows into an F32
     // destination would call a NULL function pointer and crash. Handle F32 dst with a
-    // direct float copy. Hit by graphs that scatter F32 rows into an F32 base.
+    // direct float copy. Hit by graphs that scatter F32 rows into an F32 base
+    // (e.g. the MiniMax-M3 MSA block-mask scatter of an F32 penalty into an F32 base).
     const bool dst_is_f32 = (dst->type == GGML_TYPE_F32);
     GGML_ASSERT(dst_is_f32 || from_float);
 
@@ -23058,9 +23068,13 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     }
 
 #if GGML_USE_IQK_MULMAT
+    // The iqk FA kernel consumes a single 2D mask plane (mask->nb[1] only); it does not index a
+    // per-head ne[2] plane. For a per-head mask (MiniMax-M3 MSA, ne[2] > 1) skip it and fall through
+    // to the reference FA loop below, which honours the per-head plane (iq2 % mask->ne[2]).
+    const bool per_head_mask = mask && mask->ne[2] > 1;
     // For now we do not implement sinks in the iqk FA implementation
     // DSV4 marks its FA nodes with the shared generic-FA backend hint.
-    const bool use_iqk_fa = dst->op_params[4] != GGML_FLASH_ATTN_EXT_IQK_DISABLED;
+    const bool use_iqk_fa = !per_head_mask && dst->op_params[4] != GGML_FLASH_ATTN_EXT_IQK_DISABLED;
     if (use_iqk_fa && iqk_flash_attn_noalibi(q->type, mask ? mask->type : GGML_TYPE_F16, max_bias,
                 q->ne[3], q->ne[2], q->nb[3], q->nb[2],
                 k->ne[3], k->ne[2], k->nb[3], k->nb[2],
@@ -23155,7 +23169,11 @@ static void ggml_compute_forward_flash_attn_ext_f16(
             memset(VKQ32, 0, Dkv*sizeof(float));
         }
 
-        const ggml_fp16_t * mp = mask ? (ggml_fp16_t *)((char *) mask->data + iq1*mask->nb[1]) : NULL;
+        // Per-head (per-GQA-group) mask plane: head iq2 reads mask plane (iq2 % mask->ne[2]).
+        // A 2D mask (ne[2]==1) leaves nb[2] unused -> byte-identical to the previous behaviour.
+        // Used by MiniMax-M3 MSA per-GQA-group block selection on the (CPU) flash-attn path.
+        const ggml_fp16_t * mp = mask ? (ggml_fp16_t *)((char *) mask->data
+                + iq1*mask->nb[1] + (iq2 % mask->ne[2])*mask->nb[2]) : NULL;
 
         // k indices
         const int ik3 = iq3 / rk3;

@@ -1641,6 +1641,12 @@ void llm_load_hparams(
                 ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,         hparams.expert_weights_norm, false);
                 ml.get_key(LLM_KV_EXPERT_GATING_FUNC,          hparams.expert_gating_func, false);
 
+                // MiniMax-M3 MSA (sparse attention) — optional; absent => dense fallback.
+                ml.get_key(LLM_KV_MINIMAX_SPARSE_INDEX_DIM,        hparams.minimax_sparse_index_dim,   false);
+                ml.get_key(LLM_KV_MINIMAX_SPARSE_INDEX_HEAD_COUNT, hparams.minimax_sparse_index_heads, false);
+                ml.get_key(LLM_KV_MINIMAX_SPARSE_TOPK_BLOCKS,      hparams.minimax_sparse_topk_blocks, false);
+                ml.get_key(LLM_KV_MINIMAX_SPARSE_BLOCK_SIZE,       hparams.minimax_sparse_block_size,  false);
+
                 model.type = e_model::MODEL_UNKNOWN;
             } break;
         case LLM_ARCH_SMOLLM3:

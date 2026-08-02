@@ -2,6 +2,316 @@
 #include "../llama-model.h"
 #include "../llama-context.h"
 
+// =============================================================================
+// MiniMax-M3 MSA (sparse attention) — block-sparse softmax over GQA.
+//
+// Per sparse layer a lightweight indexer scores all KV positions with a single
+// shared index-key head, those per-token scores are max-pooled into blocks of
+// B_k tokens, the top-k blocks per GQA group (plus the forced local block) are
+// selected, expanded back to a per-token additive mask (ne[2]=n_head), and that
+// mask substitutes for the dense KQ_mask in the main (full-precision softmax)
+// attention. Arch-gated to MINIMAX_M3, off by default (--msa).
+//
+// Returns nullptr to mean "use the dense KQ_mask" — disabled, non-sparse layer,
+// indexer tensors absent (e.g. a GGUF that dropped them), or cache missing. This
+// makes the path byte-identical to the dense fallback whenever it is off, and
+// (because top-k over all blocks selects everything) numerically identical to
+// dense whenever k*B_k >= n_kv (short context) — the no-op-exact validation hook.
+// =============================================================================
+ggml_tensor * llm_build_context::build_minimaxm3_msa_mask(ggml_cgraph * gf,
+        ggml_tensor * cur, ggml_tensor * inp_pos, ggml_tensor * KQ_mask, int il) {
+
+    // MSA is off by default; opt in via the --msa CLI flag (cparams.msa). When disabled the
+    // minimax-m3 model runs the dense MLA path, byte-identical to not having the feature.
+    // Arch-gated to MINIMAX-M3 (mirrors the --dsa / GLM-DSA precedent in PR #2045).
+    if (!cparams.msa)                                 return nullptr;
+    if (model.arch != LLM_ARCH_MINIMAX_M3)            return nullptr;
+    if (!hparams.minimax_sparse_layer(il))            return nullptr;
+    const auto & layer = model.layers[il];
+    if (!layer.index_q || !layer.index_k)             return nullptr;          // GGUF dropped indexer
+    if (kv_self.kr_l.size() <= (size_t) il || !kv_self.kr_l[il]) return nullptr; // no decode cache
+    // The faithful per-GQA-group selection emits a per-head mask (ne[2]=n_head). The CPU AND CUDA
+    // soft_max kernels honour the per-head plane (mask indexed by head = i02 % ne[2]) and are
+    // VALIDATED (msa-active soft_max PPL == dense within noise; selection-set diff vs HF ref = 0).
+    //
+    // The flash-attn per-head path is WIRED at the kernel level (CUDA tile/vec/wmma + CPU reference
+    // FA loop all index head = iq2 % ne[2]; ggml_flash_attn_ext assert relaxed; F16 mask cast below)
+    // and is now VALIDATED equal to the soft_max sparse path (FA -ub128 PPL 9.55 vs soft_max 9.40 at
+    // ctx 2560, 4 chunks; residual is ordinary F16-FA precision on a 2-bit base, not selection error).
+    // An earlier version of this path saw a large PPL inflation under flash-attn -ub128 that looked
+    // like a kr_l read-stride bug but was actually a GRAPH-REUSE fixup omission: update_cache_copies()
+    // re-points the K/V cache writes to the current kv_head on a reused graph but never touched the
+    // kr_l indexer write, so under FA (cache pads to 256 -> consecutive ubatches keep the same n_kv ->
+    // the graph IS reused) the indexer keys kept landing at the first ubatch's slot and recent
+    // index-key cells read 0.0. The fix registers the kr_l cpy in msa_cache_copies and patches its
+    // view_offs each reuse (see below). The gate is therefore REMOVED — MSA runs on FA by default.
+    const int64_t d_idx     = hparams.minimax_sparse_index_dim;
+    const int64_t idx_heads = hparams.minimax_sparse_index_heads > 0
+                                  ? (int64_t) hparams.minimax_sparse_index_heads
+                                  : (int64_t) hparams.n_head_kv(il);
+    const int64_t B_k       = hparams.minimax_sparse_block_size > 0
+                                  ? (int64_t) hparams.minimax_sparse_block_size : 128;
+    // --msa-top-k N overrides the model's configured topk_blocks (cparams.msa_top_k < 0 => use
+    // the GGUF value; falls back to 16 if the GGUF carries no count). Mirrors --dsa-top-k.
+    const int64_t topk_blk  = cparams.msa_top_k >= 0
+                                  ? (int64_t) cparams.msa_top_k
+                                  : (hparams.minimax_sparse_topk_blocks > 0
+                                         ? (int64_t) hparams.minimax_sparse_topk_blocks : 16);
+
+    GGML_ASSERT(KQ_mask && "MSA needs the dense causal mask for the floor");
+    const int64_t n_kv_eff = KQ_mask->ne[0];      // == n_kv
+    const int64_t n_blocks = (n_kv_eff + B_k - 1) / B_k;
+
+    // No-op-exact fast path: when the budget covers every block, MSA == dense, so we return the dense mask
+    // (nullptr) and skip the lossy argsort selection. CRITICAL: this early-out must run AFTER the index-key
+    // cache write below. On a growing context the early tokens are dense (topk_blk >= n_blocks); returning
+    // here would skip their index-key write, so once n_kv later crosses the block budget the sparse scoring
+    // reads uninitialised (zero) cache cells for those positions and the block-max-pool/top-k drops genuinely
+    // attended blocks (PPL collapse). So always compute + write the index keys first, then early-out. (index_q
+    // below is only expanded into the graph on the sparse path, so the dense case still computes just index_k.)
+    const bool msa_dense = topk_blk >= n_blocks;
+
+    // --- normed hidden (same X the main attention sees) ---
+    ggml_tensor * x = llm_build_norm(ctx0, cur, hparams, layer.attn_norm, nullptr,
+            LLM_NORM_RMS, cb, il);
+
+    // RoPE params for the indexer (must match the reference: NEOX, n_rot=64, theta=5e6).
+    // The reference applies the SAME partial RoPE the main attention uses
+    // (apply_rotary_pos_emb(idx_q, idx_k, cos[..,:head_dim], sin[..,:head_dim]) where the
+    // cos/sin width is rotary_dim=64), i.e. the first n_rot dims of the d_idx-wide index head
+    // are rotated NEOX-style and dims [n_rot, d_idx) pass through unrotated.
+    const int64_t n_rot_idx = hparams.n_rot;                  // 64 (rope.dimension_count)
+    const float   idx_freq_base  = cparams.rope_freq_base;    // 5e6
+    const float   idx_freq_scale = freq_scale;
+
+    // --- index_q : {d_idx, idx_heads, n_tokens}, RMSNorm over d_idx, then partial NEOX RoPE ---
+    ggml_tensor * iq = ggml_mul_mat(ctx0, layer.index_q, x);                 // {d_idx*idx_heads, n_tokens}
+    iq = ggml_reshape_3d(ctx0, iq, d_idx, idx_heads, n_tokens);
+    iq = llm_build_norm(ctx0, iq, hparams, layer.index_q_norm, nullptr, LLM_NORM_RMS, cb, il);
+    iq = build_minimaxm3_index_rope(iq, inp_pos, n_rot_idx, d_idx, idx_heads, idx_freq_base, idx_freq_scale, il);
+
+    // --- index_k : single shared head {d_idx, n_tokens}, RMSNorm, then partial NEOX RoPE ---
+    ggml_tensor * ik = ggml_mul_mat(ctx0, layer.index_k, x);                 // {d_idx, n_tokens}
+    ik = llm_build_norm(ctx0, ik, hparams, layer.index_k_norm, nullptr, LLM_NORM_RMS, cb, il);
+    ik = ggml_reshape_3d(ctx0, ik, d_idx, 1, n_tokens);                      // {d_idx, 1, n_tokens}
+    ik = build_minimaxm3_index_rope(ik, inp_pos, n_rot_idx, d_idx, 1, idx_freq_base, idx_freq_scale, il);
+    ik = ggml_reshape_2d(ctx0, ik, d_idx, n_tokens);                        // {d_idx, n_tokens}
+
+    // --- write this batch's index keys into the persistent cache at kv_head, read back n_kv ---
+    // ROBUSTNESS hardening: clamp the index keys to a safe finite F16 range BEFORE the cache write.
+    // On a low-bit base (IQ2_M) the indexer RMSNorm output can saturate to F16 +/-inf (|x|>65504) for
+    // some tokens; an inf in kr_l makes a later mul_mat +/-inf, and inf + causal_floor(-inf) = NaN,
+    // which POOL_MAX keeps and argsort ranks ahead of real blocks. This clamp removes that hazard.
+    // NOTE: this is unrelated to the FA -ub128 graph-reuse bug fixed just below (that was a
+    // stride/offset bug zeroing recent indexer-key cells, no inf/NaN involved) -- this clamp is
+    // defensive only and is a NO-OP on the shipping soft_max path (real keys are well within range).
+    // 6e4 is just under the F16 max (65504); the indexer score is scale-free so the clamp value is
+    // irrelevant to ranking.
+    {
+        ggml_tensor * kr = kv_self.kr_l[il];                                  // {d_idx, kv_size} F16
+        ggml_tensor * dst = ggml_view_2d(ctx0, kr, d_idx, n_tokens,
+                kr->nb[1], (size_t) kv_head * kr->nb[1]);
+        ggml_tensor * ik_safe = ggml_clamp(ctx0, ik, -6.0e4f, 6.0e4f);        // kill F16 inf/nan at the source
+        ggml_tensor * kr_cpy = ggml_cpy(ctx0, ik_safe, dst);
+        // GRAPH-REUSE FIXUP REGISTRATION: the K/V cache_copies fixup re-points the K/V write
+        // offsets to the current kv_head when a graph is reused, but it does NOT touch
+        // this indexer-key (kr_l) write. Under FA the cache pads to 256, so consecutive ubatches
+        // keep the SAME n_kv and the graph IS reused -- without this registration the kr_l write
+        // stays baked at the first ubatch's kv_head, so later ubatches never write their recent
+        // index keys (those slots read 0.0) and the block-max-pool/top-k drops the genuinely
+        // attended recent block (PPL 9.6 -> ~20). Register it like K/V so update_cache_copies()
+        // patches view_offs = kv_head * step each reuse. step = one index-key row = kr->nb[1].
+        if ((size_t) il < lctx.msa_cache_copies.size()) {
+            lctx.msa_cache_copies[il].cpy  = kr_cpy;
+            lctx.msa_cache_copies[il].step = kr->nb[1];
+        }
+        ggml_build_forward_expand(gf, kr_cpy);
+    }
+
+    // The index keys for this batch are now written to the cache; only now is it safe to take the dense
+    // no-op path (see the note at the top). This is the P0 fix: never skip the index-key write.
+    if (msa_dense) return nullptr;
+
+    ggml_tensor * cached_k = ggml_view_2d(ctx0, kv_self.kr_l[il], d_idx, n_kv_eff,
+            kv_self.kr_l[il]->nb[1], 0);                                       // {d_idx, n_kv}
+
+    // --- per-(idx-head, token) scores against all cached keys: {n_kv, idx_heads, n_tokens} ---
+    // mul_mat(cached_k {d_idx,n_kv}, iq {d_idx,idx_heads,n_tokens}) broadcasts the single
+    // key head over the idx_heads dim. The reference uses NO 1/sqrt(d_idx) scale here
+    // (scores = idx_q @ idx_k.T directly), so we do not scale either.
+    ggml_tensor * scores = ggml_mul_mat(ctx0, cached_k, iq);                  // {n_kv, idx_heads, n_tokens}
+
+    // causal floor: future / padding keys -> -inf so they never win a block max.
+    // KQ_mask is {n_kv, n_tokens_padded}; take the first n_tokens cols and broadcast over idx_heads.
+    // (reference: scores.masked_fill(k_pos > position_id, -inf) — strict, diagonal kept; the dense
+    //  causal KQ_mask carries exactly that pattern in its first n_tokens columns.)
+    // On the FA path KQ_mask is F16 (build_inp_KQ_mask casts it); the scoring math is F32, so
+    // upcast the causal-floor view to F32. Off the FA path KQ_mask is already F32 (cast is a no-op
+    // copy here, removed below by reusing the original when types match).
+    const float BIG = 1e30f;
+    ggml_tensor * floor3 = ggml_view_2d(ctx0, KQ_mask, n_kv_eff, n_tokens, KQ_mask->nb[1], 0);
+    floor3 = ggml_cont(ctx0, floor3);
+    if (floor3->type != GGML_TYPE_F32) {
+        floor3 = ggml_cast(ctx0, floor3, GGML_TYPE_F32);
+    }
+    floor3 = ggml_reshape_3d(ctx0, floor3, n_kv_eff, 1, n_tokens); // {n_kv,1,n_tok} F32
+    // Defense-in-depth for the indexer-key clamp above: clamp the raw indexer scores to a finite range
+    // BEFORE adding the causal floor. With finite scores, score + (-inf causal) = -inf (clean), so
+    // a stale/padding cell can never reach the block-max-pool as NaN. (The key clamp above already
+    // removes the inf SOURCE; this guards any residual non-finite, e.g. a pre-fix NaN still resident
+    // in kr_l.) BIG=1e30 is far above any real indexer score, so valid-cell ranking is unaffected.
+    scores = ggml_clamp(ctx0, scores, -BIG, BIG);
+    scores = ggml_add(ctx0, scores, floor3);                                  // broadcast over idx_heads
+
+    // --- BlockMaxPool over kv per idx-head: {n_kv, idx_heads, n_tokens} -> {n_blocks, idx_heads, n_tokens} ---
+    // Fold (idx_head, token) into one axis so a single pool_1d covers them all. Pad n_kv up to
+    // n_blocks*B_k with -BIG (so an all-negative block can't be beaten by zero-pad), reshape to
+    // {B_k, n_blocks * idx_heads*n_tokens}, max-reduce over B_k.
+    const int64_t HT = idx_heads * n_tokens;                                  // folded (head,token) count
+    const int64_t n_pad = n_blocks * B_k - n_kv_eff;
+    // scores -> {n_kv, idx_heads*n_tokens}
+    ggml_tensor * sc2 = ggml_reshape_2d(ctx0, ggml_cont(ctx0, scores), n_kv_eff, HT);
+    if (n_pad > 0) {
+        sc2 = ggml_pad(ctx0, sc2, n_pad, 0, 0, 0);                            // {n_blocks*B_k, HT}
+        ggml_tensor * pos = ggml_arange(ctx0, 0.0f, (float) (n_blocks * B_k), 1.0f);
+        ggml_tensor * tail = ggml_scale(ctx0,
+                ggml_step(ctx0, ggml_add1(ctx0, pos, ggml_new_f32(ctx0, -((float) n_kv_eff) + 0.5f))),
+                -BIG);                                                        // {n_blocks*B_k}
+        tail = ggml_reshape_2d(ctx0, tail, n_blocks * B_k, 1);
+        sc2 = ggml_add(ctx0, sc2, tail);                                      // broadcast over HT
+    }
+    ggml_tensor * blk = ggml_reshape_3d(ctx0, sc2, B_k, n_blocks, HT);
+    blk = ggml_pool_1d(ctx0, blk, GGML_OP_POOL_MAX, B_k, B_k, 0);             // {1, n_blocks, HT}
+    blk = ggml_reshape_3d(ctx0, blk, n_blocks, idx_heads, n_tokens);          // {n_blocks, idx_heads, n_tokens}
+    // Diagnostic tag (cb is a no-op unless an eval-callback consumes it): the pooled per-block
+    // indexer scores, shaped {n_blocks, idx_heads, n_tokens}, BEFORE local-include / top-k.
+    cb(blk, "msa_blk_scores", il);
+
+    // --- local-block force-include (reference: block_scores.scatter_(q_block, +inf)) ---
+    // For query at position p (absolute kv slot = n_past + p), the local block index is
+    // (n_past + p) // B_k. local_blocks=1 in config, so just the single containing block.
+    // We add +BIG to block (pos//B_k) for every (head, token). Build a {n_blocks, n_tokens} bump
+    // via a one-hot over the local block id, broadcast over idx_heads.
+    if (hparams.minimax_sparse_local_block) {
+        // local block id per token = (kv_head + p) / B_k, p in [0,n_tokens).  {n_tokens}
+        ggml_tensor * p = ggml_arange(ctx0, (float) kv_head, (float) (kv_head + n_tokens), 1.0f); // abs slot
+        ggml_tensor * lblk = ggml_scale(ctx0, p, 1.0f / (float) B_k);          // (kv_head+p)/B_k (float)
+        // floor via step-sum over block-id thresholds: onehot[b,t] = 1 iff floor(lblk[t])==b.
+        // Build {n_blocks, n_tokens}: for block id b, indicator (lblk - b in [0,1)).
+        // step(lblk - b) - step(lblk - (b+1)) == 1 exactly on the containing block.
+        ggml_tensor * bids = ggml_arange(ctx0, 0.0f, (float) n_blocks, 1.0f);  // {n_blocks}
+        bids = ggml_reshape_2d(ctx0, bids, n_blocks, 1);                       // {n_blocks,1}
+        ggml_tensor * lt = ggml_reshape_2d(ctx0, lblk, 1, n_tokens);           // {1,n_tokens}
+        // diff[b,t] = lblk[t] - b   (broadcast)  -> {n_blocks, n_tokens}
+        ggml_tensor * diff = ggml_add(ctx0,
+                ggml_repeat(ctx0, lt, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_blocks, n_tokens)),
+                ggml_scale(ctx0, ggml_repeat(ctx0, bids, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_blocks, n_tokens)), -1.0f));
+        // onehot = step(diff) - step(diff-1); add an epsilon so the exact integer boundary
+        // (diff==0) is firmly >0 and diff==1 is firmly excluded.
+        ggml_tensor * onehot = ggml_sub(ctx0,
+                ggml_step(ctx0, ggml_add1(ctx0, diff, ggml_new_f32(ctx0,  1e-4f))),
+                ggml_step(ctx0, ggml_add1(ctx0, diff, ggml_new_f32(ctx0, -1.0f + 1e-4f))));
+        ggml_tensor * bump = ggml_scale(ctx0, onehot, BIG);                    // {n_blocks, n_tokens}
+        bump = ggml_reshape_3d(ctx0, bump, n_blocks, 1, n_tokens);             // broadcast over idx_heads
+        blk = ggml_add(ctx0, blk, bump);
+    }
+
+    // --- per-idx-head top-k block selection -> additive block penalty {n_blocks, idx_heads, n_tokens} ---
+    // Independent top-k PER index head (the reference's [B, H_idx, S_q, n_blocks].topk(dim=-1)).
+    // Reuse the validated GLM-DSA full-coverage scatter, folding (idx_head, token) into one axis:
+    //   base/pen_b {1, n_blocks, HT}, idx {n_blocks, HT, 1}, scatter rank-penalty to sorted[rank].
+    ggml_tensor * blk2 = ggml_reshape_2d(ctx0, ggml_cont(ctx0, blk), n_blocks, HT); // {n_blocks, HT}
+    ggml_tensor * sorted = ggml_argsort(ctx0, blk2, GGML_SORT_ORDER_DESC);    // {n_blocks, HT} I32 (block ids)
+
+    // pen[rank] = 0 for rank < topk_blk, else -BIG.  {n_blocks}
+    ggml_tensor * rank = ggml_arange(ctx0, 0.0f, (float) n_blocks, 1.0f);     // {n_blocks} F32
+    ggml_tensor * sel  = ggml_step(ctx0, ggml_scale_bias(ctx0, rank, -1.0f, (float) topk_blk - 0.5f));
+    ggml_tensor * pen  = ggml_scale_bias(ctx0, sel, BIG, -BIG);               // 0 or -BIG, {n_blocks}
+
+    pen = ggml_reshape_3d(ctx0, pen, 1, n_blocks, 1);
+    ggml_tensor * pen_b = ggml_repeat(ctx0, pen,
+            ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_blocks, HT));        // {1, n_blocks, HT}
+    ggml_tensor * base = ggml_fill(ctx0,
+            ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_blocks, HT), -BIG);
+    ggml_tensor * idx = ggml_reshape_3d(ctx0, sorted, n_blocks, HT, 1);       // {n_blocks, HT, 1}
+    ggml_tensor * blk_mask = ggml_set_rows(ctx0, base, pen_b, idx);           // {1, n_blocks, HT}
+
+    // --- expand block penalty back to per-token {n_kv, idx_heads, n_tokens}: repeat each block over B_k ---
+    // blk_mask is {1, n_blocks, HT}. Repeat ne[0] 1->B_k so kv slot p=blk*B_k+b gets block blk's
+    // penalty, then crop to n_kv. Result laid out as {n_kv, idx_heads, n_tokens}.
+    ggml_tensor * tok_mask = ggml_repeat(ctx0, blk_mask,
+            ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, B_k, n_blocks, HT));      // {B_k, n_blocks, HT}
+    tok_mask = ggml_reshape_2d(ctx0, ggml_cont(ctx0, tok_mask), n_blocks * B_k, HT);
+    ggml_tensor * sparse_ht = ggml_cont(ctx0,
+            ggml_view_2d(ctx0, tok_mask, n_kv_eff, HT, tok_mask->nb[1], 0));  // {n_kv, idx_heads*n_tokens}
+    sparse_ht = ggml_reshape_3d(ctx0, sparse_ht, n_kv_eff, idx_heads, n_tokens); // {n_kv, idx_heads, n_tokens}
+    // re-add causal floor so masked-future positions stay -inf even if their block is selected.
+    sparse_ht = ggml_add(ctx0, sparse_ht, floor3);                            // broadcast over idx_heads
+
+    // --- broadcast each GQA group's selection to its query heads: idx_heads(4) -> n_head(64) ---
+    // The reference build_block_mask does repeat_interleave(num_attention_heads // n_idx_heads, dim=1).
+    // soft_max consumes a mask shaped {n_kv, n_tokens, n_head} (it indexes the mask's ne[2] by the
+    // kq head: i12 = i02 % ne12). We need head index h -> idx-group g = h / group_sz, i.e. each
+    // group's plane repeated group_sz times CONTIGUOUSLY along the head axis (repeat_interleave),
+    // NOT tiled. Lay out as {n_kv, n_tokens, idx_heads} then expand head axis by group_sz.
+    const int64_t n_head    = hparams.n_head(il);
+    const int64_t group_sz  = n_head / idx_heads;             // 16
+    // sparse_ht {n_kv, idx_heads, n_tokens} -> permute to {n_kv, n_tokens, idx_heads}
+    ggml_tensor * perm = ggml_cont(ctx0, ggml_permute(ctx0, sparse_ht, 0, 2, 1, 3)); // {n_kv, n_tokens, idx_heads}
+    // repeat_interleave over the head axis: insert a group_sz axis right after idx_heads-as-ne2,
+    // i.e. {n_kv, n_tokens, group_sz, idx_heads}? We need final head order h = g*group_sz + r with
+    // group g varying slowest. So expand to {n_kv, n_tokens, group_sz*idx_heads} where the fastest
+    // (innermost contiguous along head axis) index is r within group g. Build by repeating each
+    // group plane group_sz times contiguously: reshape ne2 idx_heads -> {1, idx_heads} then repeat
+    // ne0(the new inner)1->group_sz over a 4D temp, then fold.
+    ggml_tensor * m4 = ggml_reshape_4d(ctx0, perm, n_kv_eff, n_tokens, 1, idx_heads); // {n_kv,n_tok,1,idx_heads}
+    m4 = ggml_repeat(ctx0, m4,
+            ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_kv_eff, n_tokens, group_sz, idx_heads)); // {n_kv,n_tok,group_sz,idx_heads}
+    // fold (group_sz, idx_heads) -> n_head with idx_heads slowest, group_sz fastest => head = g*group_sz + r. good.
+    ggml_tensor * sparse = ggml_reshape_3d(ctx0, ggml_cont(ctx0, m4), n_kv_eff, n_tokens, n_head); // {n_kv, n_tokens, n_head}
+
+    // pad token axis (ne[1]) back to KQ_mask token layout (GGML_KQ_MASK_PAD) so soft_max's
+    // mask->ne[1] >= a->ne[1] holds. (Pad along ne1; head axis ne2 stays n_head.)
+    const int64_t n_tok_pad = KQ_mask->ne[1];
+    if (n_tok_pad > n_tokens) {
+        sparse = ggml_pad(ctx0, sparse, 0, n_tok_pad - n_tokens, 0, 0);
+    }
+    // Flash-attn requires an F16 mask. Cast the per-head F32 mask to F16; the BIG=1e30 drop value
+    // saturates to +inf in F16 which the FA kernels treat as a hard mask (exp(-inf)=0), so the
+    // sparse drop is preserved. The CUDA/CPU soft_max path keeps the F32 mask. Shape is
+    // {n_kv, n_tok_pad, n_head} in both cases — the kernels index the head plane by i02 % ne[2].
+    if (cparams.flash_attn && sparse->type != GGML_TYPE_F16) {
+        sparse = ggml_cast(ctx0, sparse, GGML_TYPE_F16);
+    }
+    cb(sparse, "minimax_msa_mask", il);
+    return sparse;
+}
+
+// Partial NEOX RoPE for the indexer q/k: rotate the first n_rot dims of each d_idx-wide
+// index head, pass dims [n_rot, d_idx) through unrotated, then concat back. Matches the
+// reference apply_rotary_pos_emb(idx, cos[..,:head_dim], sin[..,:head_dim]) where the cos/sin
+// width is rotary_dim = n_rot. Input/output {d_idx, n_idx_heads, n_tokens}.
+ggml_tensor * llm_build_context::build_minimaxm3_index_rope(ggml_tensor * v, ggml_tensor * inp_pos,
+        int64_t n_rot_idx, int64_t d_idx, int64_t n_idx_heads, float idx_freq_base, float idx_freq_scale, int il) {
+    if (n_rot_idx <= 0 || n_rot_idx >= d_idx) {
+        // full-width (or no) rotation
+        return ggml_rope_ext(ctx0, ggml_cont(ctx0, v), inp_pos, nullptr, (int) (n_rot_idx > 0 ? n_rot_idx : d_idx),
+                LLAMA_ROPE_TYPE_NEOX, n_ctx_orig, idx_freq_base, idx_freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+    }
+    const int64_t n_pass = d_idx - n_rot_idx;
+    const int64_t n_tok  = v->ne[2];
+    // split [0:n_rot) rope / [n_rot:d_idx) pass, per head (dim0)
+    ggml_tensor * pe = ggml_view_3d(ctx0, v, n_rot_idx, n_idx_heads, n_tok,
+            v->nb[1], v->nb[2], 0);
+    ggml_tensor * pass = ggml_view_3d(ctx0, v, n_pass, n_idx_heads, n_tok,
+            v->nb[1], v->nb[2], ggml_row_size(v->type, n_rot_idx));
+    pe = ggml_rope_ext(ctx0, ggml_cont(ctx0, pe), inp_pos, nullptr, (int) n_rot_idx,
+            LLAMA_ROPE_TYPE_NEOX, n_ctx_orig, idx_freq_base, idx_freq_scale,
+            ext_factor, attn_factor, beta_fast, beta_slow);
+    return ggml_concat(ctx0, pe, ggml_cont(ctx0, pass), 0);                   // {d_idx, n_idx_heads, n_tok}
+}
+
 ggml_cgraph* llm_build_context::build_minimaxm3() {
     ggml_cgraph * gf = new_graph_custom();
     const int64_t n_embd_head = hparams.n_embd_head_v(0);
@@ -17,9 +327,12 @@ ggml_cgraph* llm_build_context::build_minimaxm3() {
     ggml_tensor * KQ_mask = build_inp_KQ_mask();
 
     for (int il = 0; il < n_layer; ++il) {
+        // MiniMax-M3 MSA: build the block-sparse mask for this layer (nullptr => dense).
+        ggml_tensor * msa_mask  = build_minimaxm3_msa_mask(gf, inpL, inp_pos, KQ_mask, il);
+        ggml_tensor * attn_mask = msa_mask ? msa_mask : KQ_mask;
         ggml_tensor * ffn_inp = build_std_attention(gf, model.layers[il].attn_norm, inpL,
                 inp_pos, il == n_layer - 1 ? inp_out_ids : nullptr, nullptr,
-                KQ_mask, nullptr, nullptr, 1.0f / sqrtf(float(n_embd_head)), 0.0f, 0,
+                attn_mask, nullptr, nullptr, 1.0f / sqrtf(float(n_embd_head)), 0.0f, 0,
                 il, true, false, true);
 
         if ((uint32_t) il < hparams.n_layer_dense_lead) {

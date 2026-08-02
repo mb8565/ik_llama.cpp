@@ -314,6 +314,80 @@ ggml_cgraph * llm_build_context::build_k_shift() {
         }
     }
 
+    // MiniMax-M3 MSA: the persistent indexer-key cache kv_self.kr_l[il] is RoPE-position-encoded
+    // at write time (build_minimaxm3_msa_mask rotates the first n_rot dims of each d_idx-wide index key
+    // with the cell's absolute pos, NEOX, NO Hadamard). A context-shift that re-RoPEs the main K cache
+    // MUST apply the identical per-cell delta-rotation to the indexer keys, or the indexer query/key
+    // rotations desync and the top-k block selection silently degrades.
+    //
+    // UNLIKE GLM-DSA (which is an MLA model -> get_can_shift() returns FALSE -> k-shift never runs, so
+    // its kr_l shift block is dormant), MiniMax-M3 is NOT an MLA model (is_mla_model() excludes it), so
+    // get_can_shift() returns TRUE and this block IS LIVE on the serving path whenever the context is
+    // shifted. It must be correct, not dormant.
+    //
+    // Simpler than GLM-DSA: the MSA index key has no Hadamard rotation, it is just concat(RoPE(ik[:n_rot]),
+    // ik[n_rot:]). So we view the pe sub-block, RoPE it by the per-cell delta (inp_K_shift), and write back.
+    // Exactness: identical to the main K-shift above -- a delta-rotation composes with the write-time
+    // rotation exactly when NEOX RoPE is pure (ext_factor==0); under YaRN it is the same approximation the
+    // main K-shift already makes, so the indexer stays consistent WITH the main K it scores alongside.
+    // Params mirror the indexer forward RoPE exactly: NEOX, n_rot, freq_base/freq_scale (the indexer uses
+    // cparams.rope_freq_base == this freq_base), ext_factor/attn_factor, rope_factors==nullptr.
+    // MSA is the first live user of the indexer-key-cache K-shift (GLM-DSA is MLA, so it never shifts).
+    // Re-RoPE the kr_l indexer keys by the same per-cell delta as the main K cache so a shifted context
+    // keeps the indexer consistent with the K it scores alongside.
+    if (model.arch == LLM_ARCH_MINIMAX_M3 && !kv_self.kr_l.empty()) {
+        for (int il = 0; il < n_layer; ++il) {
+            if ((size_t) il >= kv_self.kr_l.size() || kv_self.kr_l[il] == nullptr) {
+                continue;
+            }
+            ggml_tensor * kr = kv_self.kr_l[il];          // {d_idx, kv_size} F16
+            const int64_t d_idx   = kr->ne[0];
+            const int64_t n_pass  = d_idx - n_rot;        // [n_rot, d_idx) passes through unrotated
+            if (n_rot <= 0 || n_rot > d_idx) {
+                continue;                                  // defensive: no/invalid partial rotation
+            }
+
+            // work in F32 for the rotation, write back to the F16 cache. Reshape to a 3D index-head
+            // view {d_idx, 1, kv_size} so ggml_rope_ext sees a per-head row layout (single shared head).
+            ggml_tensor * kr_f32 = ggml_cast(ctx0, kr, GGML_TYPE_F32);
+            for (auto * backend : lctx.backends) {
+                if (ggml_backend_supports_buft(backend, lctx.model.buft_layer[il].buft)) {
+                    ggml_backend_sched_set_tensor_backend(lctx.sched, kr_f32, backend);
+                    break;
+                }
+            }
+            cb(kr_f32, "kr_f32", il);
+
+            // pe sub-block {n_rot, 1, kv_size}; pass sub-block {n_pass, 1, kv_size}.
+            ggml_tensor * kr_pe = ggml_view_3d(ctx0, kr_f32, n_rot, 1, n_ctx,
+                    ggml_row_size(kr_f32->type, d_idx),
+                    ggml_row_size(kr_f32->type, d_idx), 0);
+            // RoPE the pe block by the per-cell delta (inp_K_shift) into a NEW tensor (non-in-place;
+            // ggml_cont copies the view first to avoid aliasing). NEOX, indexer forward params.
+            ggml_tensor * kr_pe_rot = ggml_rope_ext(ctx0, ggml_cont(ctx0, kr_pe),
+                    lctx.inp_K_shift, nullptr, n_rot, LLAMA_ROPE_TYPE_NEOX, n_ctx_orig,
+                    freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+            cb(kr_pe_rot, "kr_pe_shifted", il);
+
+            ggml_tensor * kr_new;
+            if (n_pass > 0) {
+                ggml_tensor * kr_pass = ggml_view_3d(ctx0, kr_f32, n_pass, 1, n_ctx,
+                        ggml_row_size(kr_f32->type, d_idx),
+                        ggml_row_size(kr_f32->type, d_idx),
+                        ggml_row_size(kr_f32->type, n_rot));
+                ggml_tensor * kr_cat = ggml_concat(ctx0, kr_pe_rot, ggml_cont(ctx0, kr_pass), 0);
+                kr_new = ggml_reshape_2d(ctx0, kr_cat, d_idx, n_ctx);
+            } else {
+                kr_new = ggml_reshape_2d(ctx0, kr_pe_rot, d_idx, n_ctx);
+            }
+            cb(kr_new, "kr_cat_shifted", il);
+
+            ggml_tensor * kr_back = ggml_cpy(ctx0, kr_new, kr);   // write back into F16 cache
+            cb(kr_back, "kr_shifted", il);
+            ggml_build_forward_expand(gf, kr_back);
+        }
+    }
+
     return gf;
 }
 
@@ -423,21 +497,24 @@ ggml_cgraph * llm_build_context::build_defrag(const std::vector<uint32_t> & ids)
                 ggml_build_forward_expand(gf, ggml_cpy(ctx0, view_v_src, view_v_dst));
             }
 
-            // DSA lightning-indexer key cache: move the indexer keys alongside k_l. Each cell's
-            // indexer key (kr_l row, one per cache cell) must follow its cell, or after defrag the
-            // kr_l rows no longer match the cells the indexer scores by cell index. The indexer key
-            // is RoPE-encoded at its (unchanged) absolute pos, and defrag does NOT change pos, so a
-            // plain row move is correct (no re-RoPE needed; only seq_add/K-shift change pos).
+            // Indexer-key cache (kr_l) defrag row-move, shared by GLM-DSA and MiniMax-M3 MSA: each
+            // cell's indexer key (kr_l row, one per cache cell) must follow its cell, or after defrag
+            // the kr_l rows no longer match the cells the indexer scores by cell index -> the indexer
+            // scores against mismatched keys. The indexer key is RoPE-encoded at its (unchanged)
+            // absolute pos and defrag does NOT change pos, so this is a pure row-move (no re-RoPE),
+            // mirroring the k_l/v_l move above. Only sparse layers carry kr_l (others are nullptr ->
+            // skipped). Row width is kv_self.kr_l[il]->ne[0] (== indexer_head_size for GLM-DSA, == d_idx
+            // for MSA). Only sparse layers carry kr_l; other layers are nullptr and are skipped.
             if ((size_t) il < kv_self.kr_l.size() && kv_self.kr_l[il] != nullptr) {
-                const int64_t head_size = hparams.indexer_head_size;
+                const int64_t d_idx = kv_self.kr_l[il]->ne[0];
                 ggml_tensor * view_kr_src = ggml_view_2d(ctx0, kv_self.kr_l[il],
-                        head_size, nm,
-                        ggml_row_size(kv_self.kr_l[il]->type, head_size),
-                        ggml_row_size(kv_self.kr_l[il]->type, head_size*i));
+                        d_idx, nm,
+                        ggml_row_size(kv_self.kr_l[il]->type, d_idx),
+                        ggml_row_size(kv_self.kr_l[il]->type, d_idx*i));
                 ggml_tensor * view_kr_dst = ggml_view_2d(ctx0, kv_self.kr_l[il],
-                        head_size, nm,
-                        ggml_row_size(kv_self.kr_l[il]->type, head_size),
-                        ggml_row_size(kv_self.kr_l[il]->type, head_size*id));
+                        d_idx, nm,
+                        ggml_row_size(kv_self.kr_l[il]->type, d_idx),
+                        ggml_row_size(kv_self.kr_l[il]->type, d_idx*id));
                 ggml_build_forward_expand(gf, ggml_cpy(ctx0, view_kr_src, view_kr_dst));
             }
         }
