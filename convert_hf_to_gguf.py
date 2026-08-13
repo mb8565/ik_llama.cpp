@@ -5932,6 +5932,13 @@ class MiniMaxM3Model(Model):
         if isinstance(tc, dict):
             merged = dict(tc)
             merged.update({k: v for k, v in self.hparams.items() if k not in ("text_config", "vision_config")})
+            # The MSA sparse-attention config nests one level deeper
+            # (text_config.sparse_attention_config). Flatten it too, or find_hparam()
+            # never resolves use_sparse_attention and the 4 sparse hparams are never
+            # written, silently leaving the loader on the dense fallback.
+            sac = merged.get("sparse_attention_config")
+            if isinstance(sac, dict):
+                merged.update({k: v for k, v in sac.items() if k not in merged})
             self.hparams = merged
             # block_count / tensor_map were computed in the base __init__ from the *outer*
             # config; recompute now that the text_config layer count is visible.
