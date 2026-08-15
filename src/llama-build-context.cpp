@@ -2072,7 +2072,7 @@ static ggml_tensor * llm_build_kqv(
                     int       il,
                 ggml_tensor * sinks = nullptr, int n_swa = 0, int kv_il = -1,
                 ggml_tensor ** k_cache_view = nullptr, ggml_tensor ** v_cache_view = nullptr,
-                    int32_t kv_view_offset = 0) {
+                    int32_t kv_view_offset = 0, const msa_attn_split * msa = nullptr) {
     const llama_model   & model   = lctx.model;
     const llama_hparams & hparams = lctx.model.hparams;
     const llama_cparams & cparams = lctx.cparams;
@@ -2153,21 +2153,49 @@ static ggml_tensor * llm_build_kqv(
             cb(v, "v", il);
         }
 
-        cur = ggml_flash_attn_ext(ctx, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
-                hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
-        cb(cur, "fa", il);
-        ggml_flash_attn_ext_add_sinks(cur, sinks);
-        if (n_swa > 0) {
-            ((int32_t *)cur->op_params)[4] = n_swa;
-        }
+        if (msa && msa->n_groups > 0) {
+            // MiniMax-M3 MSA: one flash-attention call per GQA group. Each call sees a single mask
+            // plane, so the mask stays at n_groups planes instead of n_head and no kernel has to
+            // resolve a per-head plane. k/v come from the gathered selection when it is present,
+            // else from the group's slice of the full-cache view.
+            const int64_t n_groups = msa->n_groups;
+            const int64_t group_sz = n_head / n_groups;
+            GGML_ASSERT(n_head % n_groups == 0 && n_head_kv == n_groups);
+            GGML_ASSERT(kq_mask && kq_mask->ne[2] == n_groups);
+            GGML_ASSERT(!sinks && n_swa == 0 && hparams.f_max_alibi_bias == 0.0f);
+            for (int64_t g = 0; g < n_groups; ++g) {
+                ggml_tensor * q_g = ggml_view_3d(ctx, q, q->ne[0], q->ne[1], group_sz,
+                        q->nb[1], q->nb[2], g*group_sz*q->nb[2]);
+                ggml_tensor * k_g = ggml_view_3d(ctx, k, k->ne[0], k->ne[1], 1, k->nb[1], k->nb[2], g*k->nb[2]);
+                ggml_tensor * v_g = ggml_view_3d(ctx, v, v->ne[0], v->ne[1], 1, v->nb[1], v->nb[2], g*v->nb[2]);
+                ggml_tensor * m_g = ggml_view_3d(ctx, kq_mask, kq_mask->ne[0], kq_mask->ne[1], 1,
+                        kq_mask->nb[1], kq_mask->nb[2], g*kq_mask->nb[2]);
+                ggml_tensor * fa_g = ggml_flash_attn_ext(ctx, q_g, k_g, v_g, m_g, kq_scale,
+                        hparams.f_max_alibi_bias,
+                        hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+                if (should_use_f32_precision) {
+                    ggml_flash_attn_ext_set_prec(fa_g, GGML_PREC_F32);
+                }
+                cur = g == 0 ? fa_g : ggml_concat(ctx, cur, fa_g, 1);
+            }
+            cb(cur, "fa", il);
+        } else {
+            cur = ggml_flash_attn_ext(ctx, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
+                    hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+            cb(cur, "fa", il);
+            ggml_flash_attn_ext_add_sinks(cur, sinks);
+            if (n_swa > 0) {
+                ((int32_t *)cur->op_params)[4] = n_swa;
+            }
 
-        // Some models produced NaNs/gibberish when FA is computed with f16 precision on CUDA
-        // For DeepSeek-2, it is perfectly fine with fp16 for PP, but I get gibberish when uding fp16 for TG.
-        // Not sure if it is really a matter of insufficient precision, or I have made a mistake in the fattn-vec-f16 kernel.
-        if (should_use_f32_precision) {
-            ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
+            // Some models produced NaNs/gibberish when FA is computed with f16 precision on CUDA
+            // For DeepSeek-2, it is perfectly fine with fp16 for PP, but I get gibberish when uding fp16 for TG.
+            // Not sure if it is really a matter of insufficient precision, or I have made a mistake in the fattn-vec-f16 kernel.
+            if (should_use_f32_precision) {
+                ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
+            }
+            //ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
         }
-        //ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
 
         if (cparams.v_cache_hadamard) {
             if (int block_size = lctx.model.hadamard_size_v(il); block_size > 0) {
@@ -2335,7 +2363,7 @@ ggml_tensor * llm_build_context::llm_build_kv(
                     float     kq_scale,
          const llm_build_cb & cb, int il, ggml_tensor * sinks, int n_swa, int kv_il,
          ggml_tensor ** k_cache_view, ggml_tensor ** v_cache_view,
-                    int32_t   swa_head) {
+                    int32_t   swa_head, const msa_attn_split * msa) {
     const llama_hparams & hparams = lctx.model.hparams;
     const llama_cparams & cparams = lctx.cparams;
 
@@ -2376,7 +2404,7 @@ ggml_tensor * llm_build_context::llm_build_kv(
     }
 
     auto cur = llm_build_kqv(ctx, lctx, kv, graph, wo, wo_b, q_cur, kq_mask, n_tokens, n_kv_view, kq_scale, cb, il, sinks, n_swa, kv_il,
-            k_cache_view, v_cache_view, kv_view_offset);
+            k_cache_view, v_cache_view, kv_view_offset, msa);
     cb(cur, "kqv_out", il);
 
     return cur;
@@ -3152,7 +3180,8 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
         ggml_tensor * input, ggml_tensor * inp_pos, ggml_tensor * inp_out_ids, ggml_tensor * rope_factors_in,
         ggml_tensor * KQ_mask, ggml_tensor * sinks, ggml_tensor * inp_attn_scale, float KQ_scale, float f_attn_scale,
         int n_swa, int il, bool do_rope, bool add_graph_split, bool add_input, bool is_norm, bool is_multi,
-        ggml_tensor * post_norm, int kv_il, float post_norm_eps, post_norm_data * pnd) {
+        ggml_tensor * post_norm, int kv_il, float post_norm_eps, post_norm_data * pnd,
+        const msa_attn_split * msa) {
 
     float freq_base_l  = n_swa > 0 ? hparams.rope_freq_base_train_swa : cparams.rope_freq_base;
     float freq_scale_l = n_swa > 0 ? hparams.rope_freq_scale_train_swa : hparams.rope_freq_scale_train;
@@ -3363,6 +3392,10 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                              ggml_row_size(split_vl->type, n_embd_head_v), 0);
                 cb(v, "v", il_cb);
 
+                // q here is this device's slice, so q->ne[2] is the per-device head count, not the
+                // model's. A per-head mask is indexed by the device-local head index, so it would
+                // read planes 0..q->ne[2] on every device. Single-plane is the only correct case.
+                GGML_ASSERT(!KQ_mask || KQ_mask->ne[2] == 1);
                 cur = ggml_flash_attn_ext(ctx0, q, k, v, KQ_mask, KQ_scale, hparams.f_max_alibi_bias,
                         hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
                 cb(cur, "flash_attn", il_cb);
@@ -3540,7 +3573,7 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
         cur = llm_build_kv(ctx0, lctx, kv_self, gf,
                 nullptr, nullptr,
                 Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, KQ_scale, cb, il, sinks, n_swa, kv_il,
-                nullptr, nullptr, swa_head);
+                nullptr, nullptr, swa_head, msa);
         cb(cur, "wqkv", il);
         auto gate = llm_build_lora_mm(lctx, ctx0, wqkv_gate, input_normed);
         if (model.arch == LLM_ARCH_LAGUNA) {
@@ -3582,7 +3615,7 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
         if (gate) {
             cur = llm_build_kv(ctx0, lctx, kv_self, gf, nullptr, nullptr,
                     Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, KQ_scale, cb, il, sinks, n_swa, kv_il,
-                    nullptr, nullptr, swa_head);
+                    nullptr, nullptr, swa_head, msa);
             if (false && cur->ne[1] == 1) { // we need to add GGML_UNARY_OP_SIGMOID to the ops supported by ggml_fused_mul_unary
                 cur = ggml_fused_mul_unary(ctx0, cur, gate, GGML_UNARY_OP_SIGMOID);
             } else {
@@ -3600,7 +3633,7 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
             cur = llm_build_kv(ctx0, lctx, kv_self, gf,
                     model.layers[il].wo, model.layers[il].bo,
                     Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, KQ_scale, cb, il, sinks, n_swa, kv_il,
-                    nullptr, nullptr, swa_head);
+                    nullptr, nullptr, swa_head, msa);
         }
     }
 

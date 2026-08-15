@@ -19,7 +19,7 @@
 // dense whenever k*B_k >= n_kv (short context) — the no-op-exact validation hook.
 // =============================================================================
 ggml_tensor * llm_build_context::build_minimaxm3_msa_mask(ggml_cgraph * gf,
-        ggml_tensor * cur, ggml_tensor * inp_pos, ggml_tensor * KQ_mask, int il) {
+        ggml_tensor * cur, ggml_tensor * inp_pos, ggml_tensor * KQ_mask, int il, msa_attn_split * msa) {
 
     // MSA is off by default; opt in via the --msa CLI flag (cparams.msa). When disabled the
     // minimax-m3 model runs the dense MLA path, byte-identical to not having the feature.
@@ -258,6 +258,37 @@ ggml_tensor * llm_build_context::build_minimaxm3_msa_mask(ggml_cgraph * gf,
     const int64_t group_sz  = n_head / idx_heads;             // 16
     // sparse_ht {n_kv, idx_heads, n_tokens} -> permute to {n_kv, n_tokens, idx_heads}
     ggml_tensor * perm = ggml_cont(ctx0, ggml_permute(ctx0, sparse_ht, 0, 2, 1, 3)); // {n_kv, n_tokens, idx_heads}
+
+    // Default path: stop at idx_heads planes and let llm_build_kqv run one attention call per GQA
+    // group. The expansion below is group_sz-fold (16x for M3) and exists only so the kernels'
+    // head-plane rule lands on the right plane; it also costs the fast iqk FA kernel, which is
+    // skipped whenever mask->ne[2] > 1. --no-msa-split-gqa asks for that wide mask back.
+    const auto & l = model.layers[il];
+    const bool tp_attn = !l.wqkv && !l.wqk && cparams.flash_attn &&
+            l.wq && l.wq->extra && l.wk && l.wk->extra && l.wv && l.wv->extra && l.wo && l.wo->extra &&
+            kv_self.k_l[il] && kv_self.k_l[il]->extra && kv_self.v_l[il] && kv_self.v_l[il]->extra;
+    // MSA has never run under tensor-parallel attention: that path issues one flash-attention call
+    // per device over that device's head slice, and indexes the mask by the DEVICE-LOCAL head, so
+    // neither an n_head-wide mask nor a per-group one is read correctly. Before this commit it died
+    // inside ggml_flash_attn_ext on `q->ne[2] % mask->ne[2] == 0` (16 % 64). Say so instead.
+    if (msa && tp_attn) {
+        LLAMA_LOG_ERROR("%s: --msa is not supported with tensor-parallel attention (-sm graph); "
+                        "run without --msa, or with -sm layer\n", __func__);
+        GGML_ABORT("minimax-m3: --msa with tensor-parallel attention");
+    }
+    if (msa && cparams.msa_split_gqa && cparams.flash_attn && !tp_attn &&
+            hparams.n_head(il) % idx_heads == 0 && (int64_t) hparams.n_head_kv(il) == idx_heads) {
+        ggml_tensor * split = perm;
+        if (KQ_mask->ne[1] > n_tokens) {
+            split = ggml_pad(ctx0, split, 0, KQ_mask->ne[1] - n_tokens, 0, 0);
+        }
+        if (split->type != GGML_TYPE_F16) {
+            split = ggml_cast(ctx0, split, GGML_TYPE_F16);
+        }
+        msa->n_groups = (int) idx_heads;
+        cb(split, "minimax_msa_mask", il);
+        return split;                                  // {n_kv, n_tok_pad, idx_heads} F16
+    }
     // repeat_interleave over the head axis: insert a group_sz axis right after idx_heads-as-ne2,
     // i.e. {n_kv, n_tokens, group_sz, idx_heads}? We need final head order h = g*group_sz + r with
     // group g varying slowest. So expand to {n_kv, n_tokens, group_sz*idx_heads} where the fastest
@@ -328,12 +359,13 @@ ggml_cgraph* llm_build_context::build_minimaxm3() {
 
     for (int il = 0; il < n_layer; ++il) {
         // MiniMax-M3 MSA: build the block-sparse mask for this layer (nullptr => dense).
-        ggml_tensor * msa_mask  = build_minimaxm3_msa_mask(gf, inpL, inp_pos, KQ_mask, il);
+        msa_attn_split msa;
+        ggml_tensor * msa_mask  = build_minimaxm3_msa_mask(gf, inpL, inp_pos, KQ_mask, il, &msa);
         ggml_tensor * attn_mask = msa_mask ? msa_mask : KQ_mask;
         ggml_tensor * ffn_inp = build_std_attention(gf, model.layers[il].attn_norm, inpL,
                 inp_pos, il == n_layer - 1 ? inp_out_ids : nullptr, nullptr,
                 attn_mask, nullptr, nullptr, 1.0f / sqrtf(float(n_embd_head)), 0.0f, 0,
-                il, true, false, true);
+                il, true, false, true, false, false, nullptr, -1, 0.0f, nullptr, &msa);
 
         if ((uint32_t) il < hparams.n_layer_dense_lead) {
             cur = llm_build_ffn(ctx0, lctx, model.layers[il].ffn_norm, ffn_inp,

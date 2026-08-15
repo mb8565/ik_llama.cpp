@@ -7984,6 +7984,7 @@ struct llama_context_params llama_context_default_params() {
         /*.mla_attn                    =*/ 3,
         /*.msa                         =*/ false,
         /*.msa_top_k                   =*/ -1,
+        /*.msa_split_gqa               =*/ true,
         /*.attn_max_batch              =*/ 256,
         /*.fused_moe_up_gate           =*/ true,
         /*.grouped_expert_routing      =*/ false,
@@ -8476,6 +8477,7 @@ struct llama_context * llama_init_from_model(
     cparams.mla_attn         = params.mla_attn;
     cparams.msa              = params.msa;
     cparams.msa_top_k        = params.msa_top_k;
+    cparams.msa_split_gqa    = params.msa_split_gqa;
     cparams.attn_max_batch   = params.attn_max_batch;
     cparams.fused_moe_up_gate= params.fused_moe_up_gate;
     cparams.grouped_expert_routing = params.grouped_expert_routing;
@@ -8655,6 +8657,15 @@ struct llama_context * llama_init_from_model(
         LLAMA_LOG_INFO("%s: dsa_idx_topk  = %d\n",     __func__, cparams.fused_idx_topk);
         if (cparams.dsa_top_k > 0) {
             LLAMA_LOG_INFO("%s: dsa_top_k     = %d\n",     __func__, cparams.dsa_top_k);
+        }
+    }
+    if (model->arch == LLM_ARCH_MINIMAX_M3) {
+        LLAMA_LOG_INFO("%s: msa           = %d\n",     __func__, cparams.msa);
+        if (cparams.msa) {
+            LLAMA_LOG_INFO("%s: msa_split_gqa = %d\n", __func__, cparams.msa_split_gqa);
+            if (cparams.msa_top_k >= 0) {
+                LLAMA_LOG_INFO("%s: msa_top_k     = %d\n", __func__, cparams.msa_top_k);
+            }
         }
     }
     if (model->arch == LLM_ARCH_OPENPANGU) {

@@ -43,6 +43,14 @@ struct post_norm_data {
     float         f_rms_eps;
 };
 
+// MiniMax-M3 MSA per-GQA-group attention. The sparse selection is per idx head (== per KV head),
+// so the mask only carries n_groups planes; running one flash-attention call per group gives every
+// call a single-plane (ne[2]==1) mask, which is the dense case both backends already handle, and
+// avoids materializing the mask at n_head planes.
+struct msa_attn_split {
+    int n_groups = 0;
+};
+
 struct llm_build_context {
     const llama_model    & model;
           llama_context  & lctx;
@@ -438,7 +446,7 @@ struct llm_build_context {
     // Returns nullptr to signal "fall back to the dense KQ_mask" (disabled / non-sparse /
     // indexer tensors absent / cache missing). `cur` is the layer input (pre attn_norm).
     ggml_tensor * build_minimaxm3_msa_mask(ggml_cgraph * gf, ggml_tensor * cur,
-            ggml_tensor * inp_pos, ggml_tensor * KQ_mask, int il);
+            ggml_tensor * inp_pos, ggml_tensor * KQ_mask, int il, msa_attn_split * msa);
     // MiniMax-M3 MSA: partial NEOX RoPE on the indexer q/k ({d_idx, n_idx_heads, n_tokens}).
     ggml_tensor * build_minimaxm3_index_rope(ggml_tensor * v, ggml_tensor * inp_pos,
             int64_t n_rot_idx, int64_t d_idx, int64_t n_idx_heads, float idx_freq_base,
@@ -512,7 +520,7 @@ struct llm_build_context {
                     float     kq_scale,
          const llm_build_cb & cb, int il, ggml_tensor * sinks = nullptr, int n_swa = 0, int kv_il = -1,
          ggml_tensor ** k_cache_view = nullptr, ggml_tensor ** v_cache_view = nullptr,
-                    int32_t   swa_head = -1);
+                    int32_t   swa_head = -1, const msa_attn_split * msa = nullptr);
 
     static ggml_tensor * llm_build_ffn(ggml_context * ctx, llama_context & lctx, ggml_tensor * ffn_norm,
          ggml_tensor * cur,
@@ -623,7 +631,7 @@ llm_expert_gating_func_type   gating_op,
             ggml_tensor * KQ_mask, ggml_tensor * sinks, ggml_tensor * inp_attn_scale, float KQ_scale, float f_attn_scale,
             int n_swa, int il, bool do_rope = true, bool add_graph_split = false, bool add_input = false, bool is_norm = false,
             bool is_multi = false, ggml_tensor * post_norm = nullptr, int kv_il = -1, float post_norm_eps = 0.0f,
-            post_norm_data * pnd = nullptr);
+            post_norm_data * pnd = nullptr, const msa_attn_split * msa = nullptr);
 
     static ggml_tensor * build_output(llama_context & lctx, ggml_context * ctx, ggml_tensor * cur, ggml_tensor * output, const llm_build_cb & cb);
 
