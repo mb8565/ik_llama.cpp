@@ -816,6 +816,12 @@ class GGUFWriter:
     def add_attention_indexer_key_length(self, length: int) -> None:
         self.add_uint32(Keys.Attention.INDEXER_KEY_LENGTH.format(arch=self.arch), length)
 
+    def add_attention_indexer_block_size(self, size: int) -> None:
+        self.add_uint32(Keys.Attention.INDEXER_BLOCK_SIZE.format(arch=self.arch), size)
+
+    def add_attention_indexer_local_blocks(self, blocks: int) -> None:
+        self.add_uint32(Keys.Attention.INDEXER_LOCAL_BLOCKS.format(arch=self.arch), blocks)
+
     def add_attention_indexer_top_k(self, top_k: int) -> None:
         self.add_uint32(Keys.Attention.INDEXER_TOP_K.format(arch=self.arch), top_k)
 

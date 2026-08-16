@@ -138,6 +138,9 @@ class Keys:
         SPARSE_INDEX_HEAD_COUNT      = "{arch}.attention.sparse_index_head_count"
         SPARSE_TOPK_BLOCKS           = "{arch}.attention.sparse_topk_blocks"
         SPARSE_BLOCK_SIZE            = "{arch}.attention.sparse_block_size"
+        # Mainline llama.cpp's spelling for the same MSA indexer config (conversion/minimax.py).
+        INDEXER_BLOCK_SIZE           = "{arch}.attention.indexer.block_size"
+        INDEXER_LOCAL_BLOCKS         = "{arch}.attention.indexer.local_blocks"
 
     class Rope:
         DIMENSION_COUNT          = "{arch}.rope.dimension_count"
@@ -554,10 +557,10 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.ATTN_Q_NORM:          "blk.{bid}.attn_q_norm",
     MODEL_TENSOR.ATTN_K_NORM:          "blk.{bid}.attn_k_norm",
     MODEL_TENSOR.ATTN_SINKS:           "blk.{bid}.attn_sinks",
-    MODEL_TENSOR.INDEX_Q:              "blk.{bid}.index_q",
-    MODEL_TENSOR.INDEX_Q_NORM:         "blk.{bid}.index_q_norm",
-    MODEL_TENSOR.INDEX_K:              "blk.{bid}.index_k",
-    MODEL_TENSOR.INDEX_K_NORM:         "blk.{bid}.index_k_norm",
+    MODEL_TENSOR.INDEX_Q:              "blk.{bid}.indexer.q_proj",
+    MODEL_TENSOR.INDEX_Q_NORM:         "blk.{bid}.indexer.q_norm",
+    MODEL_TENSOR.INDEX_K:              "blk.{bid}.indexer.k_proj",
+    MODEL_TENSOR.INDEX_K_NORM:         "blk.{bid}.indexer.k_norm",
     MODEL_TENSOR.ATTN_OUT_NORM:        "blk.{bid}.attn_output_norm",
     MODEL_TENSOR.ATTN_POST_NORM:       "blk.{bid}.post_attention_norm",
     MODEL_TENSOR.ATTN_GATE:            "blk.{bid}.attn_gate",

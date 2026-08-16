@@ -5917,10 +5917,11 @@ class MiniMaxM3Model(Model):
     # MiniMax-M3: MoE GQA (per-head QK-norm, partial RoPE) + DeepSeek-style leading-dense
     # + routed/shared experts, plus the MSA (block-sparse attention) indexer.
     #
-    # Unlike mainline PR #24523 (which DROPS every `.index_` tensor and writes no sparse
-    # hparams, forcing a permanent dense fallback), this converter PRESERVES the indexer
-    # tensors (mapped to blk.N.index_{q,q_norm,k,k_norm}) and writes the 4 MSA sparse
-    # hparams so the ik MSA-capable loader can run faithful block-sparse attention.
+    # Preserves the indexer tensors (mapped to blk.N.index_{q,q_norm,k,k_norm}) and writes
+    # the 4 MSA sparse hparams, so the MSA-capable loader can run faithful block-sparse
+    # attention. Mainline llama.cpp spells the same information differently -- see
+    # conversion/minimax.py there: blk.N.indexer.{q,k}_proj / .{q,k}_norm and the five
+    # {arch}.attention.indexer.* keys. The loader here reads BOTH spellings.
     model_arch = gguf.MODEL_ARCH.MINIMAXM3
     _experts_cache: dict[int, dict[str, Tensor]] = {}
 
@@ -5982,14 +5983,19 @@ class MiniMaxM3Model(Model):
         # MSA (block-sparse attention) hparams. These let the MSA-capable loader pick up
         # the preserved indexer tensors; absent them, the loader falls back to dense.
         if self.find_hparam(["use_sparse_attention"], optional=True):
-            self.gguf_writer.add_sparse_index_dim(self.find_hparam(["sparse_index_dim"]))
-            self.gguf_writer.add_sparse_index_head_count(self.find_hparam(["sparse_num_index_heads"]))
-            self.gguf_writer.add_sparse_topk_blocks(self.find_hparam(["sparse_topk_blocks"]))
-            self.gguf_writer.add_sparse_block_size(self.find_hparam(["sparse_block_size"]))
+            # Mainline llama.cpp's spelling (conversion/minimax.py), so a GGUF produced here
+            # also runs MSA there. The loader on this side reads this spelling first.
+            self.gguf_writer.add_attention_indexer_head_count(self.find_hparam(["sparse_num_index_heads"]))
+            self.gguf_writer.add_attention_indexer_key_length(self.find_hparam(["sparse_index_dim"]))
+            self.gguf_writer.add_attention_indexer_top_k(self.find_hparam(["sparse_topk_blocks"]))
+            self.gguf_writer.add_attention_indexer_block_size(self.find_hparam(["sparse_block_size"]))
+            local_blocks = self.find_hparam(["sparse_local_block"], optional=True)
+            if local_blocks is not None:
+                self.gguf_writer.add_attention_indexer_local_blocks(local_blocks)
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None):
-        # Drop vision / projector / patch-merge (text-only). NOTE: unlike PR #24523 we do
-        # NOT drop the `.index_` indexer tensors — they are preserved below.
+        # Drop vision / projector / patch-merge (text-only). The `.index_` indexer tensors
+        # are NOT dropped -- they are preserved below.
         if name.startswith(("vision_tower", "multi_modal_projector", "patch_merge_mlp")):
             return []
 
