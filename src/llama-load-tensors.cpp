@@ -4570,6 +4570,20 @@ bool create_tensors_helper::create_minimaxm3_tensors(const LLM_TN & tn) {
             layer.index_q_norm = create_tensor(ctx_split, tn(LLM_TENSOR_INDEX_Q_NORM, "weight", i), { d_idx },                     llama_model_loader::TENSOR_NOT_REQUIRED);
             layer.index_k      = create_tensor(ctx_split, tn(LLM_TENSOR_INDEX_K,      "weight", i), { n_embd, d_idx },             llama_model_loader::TENSOR_NOT_REQUIRED);
             layer.index_k_norm = create_tensor(ctx_split, tn(LLM_TENSOR_INDEX_K_NORM, "weight", i), { d_idx },                     llama_model_loader::TENSOR_NOT_REQUIRED);
+            // Mainline llama.cpp's converter names these blk.N.indexer.{q,k}_proj / .{q,k}_norm.
+            // Accept that spelling too, so a GGUF produced by any mainline-based conversion runs
+            // MSA here rather than silently falling back to dense.
+            if (!layer.index_q) {
+                char buf[128];
+                snprintf(buf, sizeof(buf), "blk.%d.indexer.q_proj.weight", i);
+                layer.index_q      = create_tensor(ctx_split, buf, { n_embd, d_idx * idx_heads }, llama_model_loader::TENSOR_NOT_REQUIRED);
+                snprintf(buf, sizeof(buf), "blk.%d.indexer.q_norm.weight", i);
+                layer.index_q_norm = create_tensor(ctx_split, buf, { d_idx },                     llama_model_loader::TENSOR_NOT_REQUIRED);
+                snprintf(buf, sizeof(buf), "blk.%d.indexer.k_proj.weight", i);
+                layer.index_k      = create_tensor(ctx_split, buf, { n_embd, d_idx },             llama_model_loader::TENSOR_NOT_REQUIRED);
+                snprintf(buf, sizeof(buf), "blk.%d.indexer.k_norm.weight", i);
+                layer.index_k_norm = create_tensor(ctx_split, buf, { d_idx },                     llama_model_loader::TENSOR_NOT_REQUIRED);
+            }
         }
 
         layer.ffn_norm = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_NORM, "weight", i), { n_embd }, 0);
