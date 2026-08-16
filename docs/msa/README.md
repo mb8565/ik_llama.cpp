@@ -1,0 +1,138 @@
+# MiniMax-M3 sparse attention: `--msa-gather`
+
+MiniMax-M3's sparse attention (MSA) scores every cached token against four index heads, max-pools
+those scores into blocks of 128, and attends only the top 16 blocks per index head. The answer to
+"which cells does this query attend" is therefore **16 block ids** — about 64 bytes.
+
+This branch stops turning that answer into a mask.
+
+---
+
+## What the code did before
+
+Per sparse layer, per ubatch, the selection was expanded into an additive mask as wide as the whole
+KV cache:
+
+```
+top-k block ids  ->  repeat to block size  ->  cont  ->  add causal floor
+                 ->  permute  ->  pad  ->  cast to F16   =  {n_kv, n_tokens, idx_heads}
+```
+
+Then flash-attention consumed that mask and discarded ~97% of it.
+
+Two costs follow. The mask is most of the compute buffer, and it grows with context: the measured law
+was `0.262268 x n_kv + 70 MiB` at ubatch 512, or **34,446 MiB at 128k** against a flat 403 MiB for
+dense attention. And `ggml_flash_attn_ext` requires `mask->ne[1] >= GGML_PAD(n_tokens, 16)`, so at
+decode a **single token's mask is padded to 16 rows and cast** — per sparse layer, to carry one real
+row.
+
+## What it does now
+
+ik's flash-attention kernel already accepts a sparse cell list: put an I32 tensor on the node's
+`src[5]` and `iqk_flash_attn_noalibi` gathers K, V and the mask itself, per query row
+(`ggml/src/iqk/iqk_flash_attn.cpp:180`). GLM-DSA drives the same mechanism from
+`build_deepseek2.cpp`. MSA could not use it before, because that path requires a single KV head and
+MSA's mask carried four planes — the per-GQA-group split in the parent commit is what made the shape
+legal.
+
+So the only missing piece was the list itself:
+
+```
+sorted (I32 block ids, already computed)      first topk_blk rows = the selection
+ggml_mask_to_index(all-zero mask)             -> [0, n_kv) as I32, reshaped {B_k, n_blocks}
+ggml_get_rows_ext(table, ids, same_type)      -> the cell ids for the selected blocks
+                                              -> attached to fa->src[5]
+```
+
+ggml has no integer arithmetic and `ggml_cast` cannot produce I32 (`ggml_compute_forward_dup` handles
+F32/F16/BF16 sources only), so the zero-mask trick is the one construction the tree supports today.
+
+With the list in hand, **no sparse mask is built at all**. The kernel reads a mask only at the
+selected positions, and the causal floor it needs is already in `KQ_mask`, which the graph builds once
+and every sparse layer shares.
+
+---
+
+## Results
+
+MiniMax-M3 Q4_K_M, CPU-only, dual Xeon Platinum 8260, 376 GB DDR4, `-t 48`. Each arm is the same
+binary; only the flag differs. Dense is measured at **its own best ubatch (2048)** and MSA at its
+best (512) — see the caveat below, it matters.
+
+![arms at 64k](arms-64k.png)
+
+| 64k, npp 65536 / ntg 64 | prefill t/s | decode t/s | compute buffer |
+|---|---:|---:|---:|
+| dense, tuned | 19.52 | 1.76 | 403 MiB |
+| `--msa` (mask path) | — | 1.47 | 1,578 MiB |
+| `--msa --msa-gather` | **26.92** | **2.05** | 1,350 MiB |
+| | **1.38x** | **1.16x** | |
+
+### The advantage is a long-context advantage
+
+![advantage vs context](advantage-vs-context.png)
+
+At 16k the prefill gain is 1.02x — essentially nothing. The gathered work is flat in `n_kv` while
+dense attention is not, so the advantage appears with depth.
+
+**Why dense is quoted at ubatch 2048 and MSA at 512.** A wider ubatch amortises weight streaming
+across more query rows, which is most of dense prefill: dense gains **+24.7% at 16k and +20.5% at
+64k** from `-ub 2048`. MSA gains ~1%, because its prefill kernel is invoked once per query token and
+cannot use the wider batch. Comparing both at 512 would flatter this branch by reporting 1.66x
+instead of 1.38x.
+
+### Compute buffer
+
+![compute buffer](compute-buffer.png)
+
+2,635 MiB at 128k where the mask path's own measured law predicts 34,446 MiB. Still `O(n_kv)` rather
+than flat like dense — something in this path still scales and has not been identified.
+
+---
+
+## Quality
+
+Sparse attention changes which cells are attended, so this needs a metric that survives an argmax
+flip; greedy text does not.
+
+![decode KLD](decode-kld.png)
+
+The measurement that matters is **decode-only**. `llama-perplexity` evaluates in batches, so its graph
+is a prefill graph and it never exercises a decode gather at all. Forcing `-ub 1` makes every
+evaluation a single-token decode graph:
+
+| decode arm, ctx 8192, `-ub 1`, 1 chunk vs a dense reference | mean KLD | same top-1 |
+|---|---:|---:|
+| `--msa` (mask path) | 0.014548 ± 0.000546 | 96.020% |
+| `--msa --msa-gather` | **0.014529 ± 0.000536** | **96.215%** |
+
+0.02 sigma apart. For context, an earlier construction that derived the same list by scanning the
+sparse mask for values exactly zero scored **0.037960 ± 0.002456** — nine sigma worse, and invisible
+to both greedy text and ordinary batched perplexity.
+
+---
+
+## What this does not do
+
+- **No help on hybrid GPU.** With 8 of 61 layers on four P100s, dense reaches 53.37 t/s prefill and
+  every MSA arm lands between 30 and 34. MSA nearly doubles backend graph splits (1410 vs 774) and
+  each split is a synchronisation. Use dense there.
+- **Nothing at short context.** 1.02x at 16k.
+- **Decode gather is off inside this flag's fast path only where it is safe**; the largest remaining
+  CPU lever is untouched — the prefill kernel is called once per query token, making every sparse
+  GEMM 16 wide, roughly 1.31x under its arithmetic roofline.
+
+## Using it
+
+```
+llama-cli -m <MiniMax-M3 GGUF> --msa --msa-gather -c 65536 -t 48 -fa 1 ...
+```
+
+`--msa-gather` is off by default. It falls back to the mask path for tensor-parallel attention,
+`-fa 0`, an `n_kv` that is not a multiple of the block size, and any model whose head counts do not
+divide.
+
+GGUFs converted by mainline llama.cpp are read directly on this branch. Mainline spells the indexer
+hyper-parameters `attention.indexer.*` and its tensors `blk.N.indexer.{q,k}_proj`; our converter wrote
+`attention.sparse_*` and `blk.N.index_{q,k}`. Both spellings are accepted now, so a published
+conversion runs MSA here instead of silently falling back to dense.
