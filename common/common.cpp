@@ -1957,6 +1957,10 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.msa_top_k = std::stoi(argv[i]);
         return true;
     }
+    if (arg == "-msag" || arg == "--msa-gather") {
+        params.msa_gather = true;
+        return true;
+    }
     if (arg == "-no-msasg" || arg == "--no-msa-split-gqa") {
         params.msa_split_gqa = false;
         return true;
@@ -3094,6 +3098,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-dsatk, --dsa-top-k",           "DSA top-k override; <0 uses the model's configured indexer_top_k (default: %d)", params.dsa_top_k });
     options.push_back({ "*",           "-msa,  --msa",                  "enable MiniMax-M3 sparse attention (MINIMAX-M3 arch only; default: %s)", params.msa ? "enabled" : "disabled" });
     options.push_back({ "*",           "-msatk, --msa-top-k",           "MSA top-k blocks override; <0 uses the model's configured topk_blocks (default: %d)", params.msa_top_k });
+    options.push_back({ "*",           "-msag, --msa-gather",           "MSA: attend only the selected cells (FA-kernel gather; default: %s)", params.msa_gather ? "enabled" : "disabled" });
     options.push_back({ "*",           "-no-msasg, --no-msa-split-gqa", "MSA: attend all heads in one call under an n_head-wide mask (default: %s)", params.msa_split_gqa ? "disabled" : "enabled" });
     options.push_back({ "*",           "-amb,  --attention-max-batch",  "max batch size for attention computations (default: %d)", params.attn_max_batch});
     options.push_back({ "*",           "-no-fmoe, --no-fused-moe",      "disable fused MoE (default: %s)", params.fused_moe_up_gate ? "enabled" : "disabled" });
@@ -4373,6 +4378,7 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.msa               = params.msa;
     cparams.msa_top_k         = params.msa_top_k;
     cparams.msa_split_gqa     = params.msa_split_gqa;
+    cparams.msa_gather        = params.msa_gather;
     cparams.attn_max_batch    = params.attn_max_batch;
     cparams.fused_moe_up_gate = params.fused_moe_up_gate;
     cparams.grouped_expert_routing = params.grouped_expert_routing;

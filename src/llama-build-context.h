@@ -49,6 +49,11 @@ struct post_norm_data {
 // avoids materializing the mask at n_head planes.
 struct msa_attn_split {
     int n_groups = 0;
+    // Cell index list per group, set when the mask builder produced a list instead of a mask.
+    std::vector<ggml_tensor *> idx;
+    // When > 0, the per-group flash-attention call gets an I32 index list on src[5] and the FA
+    // kernel gathers K, V and the mask itself. Same mechanism DSA uses (build_deepseek2.cpp).
+    int n_gather = 0;
 };
 
 struct llm_build_context {

@@ -34,6 +34,7 @@ struct llama_cparams {
     int  mla_attn;
     bool msa = false;      // enable MiniMax-M3 sparse attention (off by default; opt-in via --msa)
     int  msa_top_k = -1;   // MSA top-k blocks override (<0 => use the model's configured topk_blocks)
+    bool msa_gather = false;    // MSA: FA-kernel gather of the selected cells (--msa-gather)
     bool msa_split_gqa = true;  // MSA: one attention call per GQA group (on by default; --no-msa-split-gqa)
     int  attn_max_batch;
     bool fused_moe_up_gate;

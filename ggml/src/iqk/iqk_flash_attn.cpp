@@ -178,7 +178,26 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
 
     if (type_q != 0 || type_mask != 1 || max_bias > 0) return false;
 
+    // DIAGNOSTIC (DO NOT SHIP): print even when indexer is NULL -- "no trace" otherwise cannot
+    // distinguish "src[5] never arrived" from "arrived but the guard rejected it".
+    if (ith == 0) {
+        static int t0 = -1, p0 = 0;
+        if (t0 < 0) { const char * e = getenv("MSA_IDX_TRACE"); t0 = e ? atoi(e) : 0; }
+        if (p0 < t0) { ++p0;
+            fprintf(stderr, "MSA_IDX_PRE: indexer=%p type=%d nek1=%d neq1=%d nek2=%d\n",
+                    (const void *)indexer, indexer ? (int)indexer->type : -1, (int)nek1, (int)neq1, (int)nek2);
+        }
+    }
     if (indexer && indexer->type == GGML_TYPE_I32) {
+        if (ith == 0) {
+            static int trace = -1, printed = 0;
+            if (trace < 0) { const char * e = getenv("MSA_IDX_TRACE"); trace = e ? atoi(e) : 0; }
+            if (printed < trace) { ++printed;
+                fprintf(stderr, "MSA_IDX: taken=%d idx_ne0=%d nek1=%d neq1=%d neq2=%d nek2=%d\n",
+                        (int)(indexer->ne[0] < nek1 && neq3 == 1 && nek3 == 1 && nev3 == 1 && nek2 == 1),
+                        (int)indexer->ne[0], (int)nek1, (int)neq1, (int)neq2, (int)nek2);
+            }
+        }
         //if (indexer->ne[0] < nek1 && neq1 >= nth && neq3 == 1 && nek3 == 1 && nev3 == 1 && nek2 == 1) {
         if (indexer->ne[0] < nek1 && neq3 == 1 && nek3 == 1 && nev3 == 1 && nek2 == 1) {
             // Workbuffer: we need

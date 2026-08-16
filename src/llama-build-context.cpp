@@ -2161,7 +2161,10 @@ static ggml_tensor * llm_build_kqv(
             const int64_t n_groups = msa->n_groups;
             const int64_t group_sz = n_head / n_groups;
             GGML_ASSERT(n_head % n_groups == 0 && n_head_kv == n_groups);
-            GGML_ASSERT(kq_mask && kq_mask->ne[2] == n_groups);
+            // ne[2] == 1 is index-list mode: one shared causal mask, selection carried on src[5].
+            GGML_ASSERT(kq_mask && (kq_mask->ne[2] == n_groups || kq_mask->ne[2] == 1));
+            const bool shared_mask = kq_mask->ne[2] == 1;
+            GGML_ASSERT(!shared_mask || (int) msa->idx.size() == n_groups);
             GGML_ASSERT(!sinks && n_swa == 0 && hparams.f_max_alibi_bias == 0.0f);
             for (int64_t g = 0; g < n_groups; ++g) {
                 ggml_tensor * q_g = ggml_view_3d(ctx, q, q->ne[0], q->ne[1], group_sz,
@@ -2169,10 +2172,20 @@ static ggml_tensor * llm_build_kqv(
                 ggml_tensor * k_g = ggml_view_3d(ctx, k, k->ne[0], k->ne[1], 1, k->nb[1], k->nb[2], g*k->nb[2]);
                 ggml_tensor * v_g = ggml_view_3d(ctx, v, v->ne[0], v->ne[1], 1, v->nb[1], v->nb[2], g*v->nb[2]);
                 ggml_tensor * m_g = ggml_view_3d(ctx, kq_mask, kq_mask->ne[0], kq_mask->ne[1], 1,
-                        kq_mask->nb[1], kq_mask->nb[2], g*kq_mask->nb[2]);
+                        kq_mask->nb[1], kq_mask->nb[2], shared_mask ? 0 : g*kq_mask->nb[2]);
                 ggml_tensor * fa_g = ggml_flash_attn_ext(ctx, q_g, k_g, v_g, m_g, kq_scale,
                         hparams.f_max_alibi_bias,
                         hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+                if (!msa->idx.empty()) {
+                    fa_g->src[5] = msa->idx[g];
+                } else if (msa->n_gather > 0 && msa->n_gather < k_g->ne[1]) {
+                    // One index row per query token, listing the cells this token actually attends.
+                    // The kernel reads it at src[5] and gathers K/V/mask per row, so this covers
+                    // prefill as well as decode. -1 padding is handled there (it writes -inf).
+                    ggml_tensor * idx = ggml_mask_to_index(ctx, m_g, msa->n_gather);
+                    ggml_build_forward_expand(graph, idx);
+                    fa_g->src[5] = idx;
+                }
                 if (should_use_f32_precision) {
                     ggml_flash_attn_ext_set_prec(fa_g, GGML_PREC_F32);
                 }

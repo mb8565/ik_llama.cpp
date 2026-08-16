@@ -220,6 +220,11 @@ ggml_tensor * llm_build_context::build_minimaxm3_msa_mask(ggml_cgraph * gf,
     // Independent top-k PER index head (the reference's [B, H_idx, S_q, n_blocks].topk(dim=-1)).
     // Reuse the validated GLM-DSA full-coverage scatter, folding (idx_head, token) into one axis:
     //   base/pen_b {1, n_blocks, HT}, idx {n_blocks, HT, 1}, scatter rank-penalty to sorted[rank].
+    const auto & l_early = model.layers[il];
+    const bool tp_attn_early = !l_early.wqkv && !l_early.wqk && cparams.flash_attn &&
+            l_early.wq && l_early.wq->extra && l_early.wk && l_early.wk->extra &&
+            l_early.wv && l_early.wv->extra && l_early.wo && l_early.wo->extra &&
+            kv_self.k_l[il] && kv_self.k_l[il]->extra && kv_self.v_l[il] && kv_self.v_l[il]->extra;
     ggml_tensor * blk2 = ggml_reshape_2d(ctx0, ggml_cont(ctx0, blk), n_blocks, HT); // {n_blocks, HT}
     ggml_tensor * sorted = ggml_argsort(ctx0, blk2, GGML_SORT_ORDER_DESC);    // {n_blocks, HT} I32 (block ids)
 
@@ -227,6 +232,44 @@ ggml_tensor * llm_build_context::build_minimaxm3_msa_mask(ggml_cgraph * gf,
     ggml_tensor * rank = ggml_arange(ctx0, 0.0f, (float) n_blocks, 1.0f);     // {n_blocks} F32
     ggml_tensor * sel  = ggml_step(ctx0, ggml_scale_bias(ctx0, rank, -1.0f, (float) topk_blk - 0.5f));
     ggml_tensor * pen  = ggml_scale_bias(ctx0, sel, BIG, -BIG);               // 0 or -BIG, {n_blocks}
+
+    // --- index-list mode (--msa-gather): stop here, no {n_kv, idx_heads} mask is ever built -----
+    // `sorted` holds block ids in descending score order per (idx head, token) and the local-block
+    // bump is already in the scores, so its first topk_blk rows ARE the selection. Everything below
+    // this block exists to turn that into an n_kv-wide additive mask; with an index list on src[5]
+    // the FA kernel reads the mask at only topk_blk*B_k positions, and the causal floor it needs is
+    // already in KQ_mask, which the graph builds once and every layer shares.
+    //
+    // The mask chain this skips is not small at decode: ggml_flash_attn_ext requires
+    // mask->ne[1] >= GGML_PAD(n_tokens, 16), so a single decode token still pads the mask to 16 rows
+    // and then casts it, per sparse layer.
+    if (cparams.msa_gather && cparams.msa_split_gqa && cparams.flash_attn && !tp_attn_early &&
+            n_kv_eff % B_k == 0 && topk_blk*B_k < n_kv_eff &&
+            hparams.n_head(il) % idx_heads == 0 && (int64_t) hparams.n_head_kv(il) == idx_heads) {
+        const int64_t n_gather = topk_blk * B_k;
+        // Cell-id table {B_k, n_blocks} I32. ggml has no I32 arithmetic and ggml_cast cannot make
+        // I32 (ggml_compute_forward_dup handles F32/F16/BF16 sources only), so build it the one way
+        // the tree already supports: mask_to_index over an all-zero mask returns [0 .. n_kv).
+        ggml_tensor * zero = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_kv_eff, 1), 0.0f);
+        ggml_tensor * table = ggml_mask_to_index(ctx0, zero, (int) n_kv_eff);       // {n_kv,1} I32
+        table = ggml_reshape_2d(ctx0, table, B_k, n_blocks);                        // {B_k, n_blocks}
+        // Selected block ids, contiguous: {topk_blk, HT} -> flat.
+        ggml_tensor * sel_blk = ggml_cont(ctx0,
+                ggml_view_2d(ctx0, sorted, topk_blk, HT, sorted->nb[1], 0));        // {topk_blk, HT} I32
+        ggml_tensor * flat = ggml_reshape_1d(ctx0, sel_blk, topk_blk*HT);
+        ggml_tensor * cells = ggml_get_rows_ext(ctx0, table, flat, true, false);    // {B_k, topk_blk*HT} I32
+        cells = ggml_reshape_2d(ctx0, ggml_cont(ctx0, cells), n_gather, HT);        // {n_gather, HT}
+        ggml_build_forward_expand(gf, cells);
+        msa->n_groups = (int) idx_heads;
+        msa->idx.clear();
+        for (int64_t g = 0; g < idx_heads; ++g) {
+            // HT folds (idx_head, token) with idx_head fastest, so group g is a strided view.
+            msa->idx.push_back(ggml_view_2d(ctx0, cells, n_gather, n_tokens,
+                    cells->nb[1]*idx_heads, g*cells->nb[1]));
+        }
+        cb(cells, "minimax_msa_cells", il);
+        return KQ_mask;                                    // causal floor only, shared by all layers
+    }
 
     pen = ggml_reshape_3d(ctx0, pen, 1, n_blocks, 1);
     ggml_tensor * pen_b = ggml_repeat(ctx0, pen,
@@ -286,6 +329,12 @@ ggml_tensor * llm_build_context::build_minimaxm3_msa_mask(ggml_cgraph * gf,
             split = ggml_cast(ctx0, split, GGML_TYPE_F16);
         }
         msa->n_groups = (int) idx_heads;
+        if (cparams.msa_gather) {
+            const int64_t n_gather = topk_blk * B_k;
+            // The selection names exactly topk_blk*B_k cells per query. Hand that count down and
+            // llm_build_kqv attaches the index list the FA kernels already know how to consume.
+            msa->n_gather = (int) n_gather;
+        }
         cb(split, "minimax_msa_mask", il);
         return split;                                  // {n_kv, n_tok_pad, idx_heads} F16
     }
