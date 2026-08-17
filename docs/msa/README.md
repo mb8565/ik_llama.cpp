@@ -21,8 +21,8 @@ top-k block ids  ->  repeat to block size  ->  cont  ->  add causal floor
 Then flash-attention consumed that mask and discarded ~97% of it.
 
 Two costs follow. The mask is most of the compute buffer, and it grows with context: the measured law
-was `0.262268 x n_kv + 70 MiB` at ubatch 512, or **34,446 MiB at 128k** against a flat 403 MiB for
-dense attention. And `ggml_flash_attn_ext` requires `mask->ne[1] >= GGML_PAD(n_tokens, 16)`, so at
+was `0.262268 x n_kv + 70 MiB` at ubatch 512, or **34,446 MiB at 128k**, against 403 MiB for dense
+at 16k. And `ggml_flash_attn_ext` requires `mask->ne[1] >= GGML_PAD(n_tokens, 16)`, so at
 decode a **single token's mask is padded to 16 rows and cast** — per sparse layer, to carry one real
 row.
 
@@ -93,10 +93,11 @@ claimed here. Quoting each arm at its own best `-ub` is the honest comparison ei
 
 ![compute buffer](compute-buffer.png)
 
-1,350 MiB at 64k, where the mask path's own measured law predicts 17,258 MiB. Still `O(n_kv)`
-rather than flat like dense — something in this path scales and has not been identified. (A 128k
-point of 2,635 MiB was taken earlier against the same law's 34,446 MiB, but not re-measured in this
-configuration, so the chart stops at 64k.)
+1,350 MiB at 64k, where the mask path's own measured law predicts 17,258 MiB. It still grows with
+`n_kv` — but so does dense, which is 403 MiB at 16k and 1,611 MiB at 64k, so at equal context the
+gather's buffer is **smaller than dense's**, not larger. (A 128k point of 2,635 MiB was taken
+earlier against the same law's 34,446 MiB, but not re-measured in this configuration, so the chart
+stops at 64k.)
 
 ---
 
