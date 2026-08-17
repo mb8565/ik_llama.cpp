@@ -61,25 +61,33 @@ best (512) — see the caveat below, it matters.
 
 ![arms at 64k](arms-64k.png)
 
-| 64k, npp 65536 / ntg 64 | prefill t/s | decode t/s | compute buffer |
-|---|---:|---:|---:|
-| dense, tuned | 19.52 | 1.76 | 403 MiB |
-| `--msa` (mask path) | — | 1.47 | 1,578 MiB |
-| `--msa --msa-gather` | **26.92** | **2.05** | 1,350 MiB |
-| | **1.38x** | **1.16x** | |
+| 64k, npp 65536 / ntg 64 | `-ub` | prefill t/s | decode t/s | compute buffer |
+|---|---:|---:|---:|---:|
+| dense, tuned | 2048 | 19.42 | 1.84 | 1,611 MiB |
+| `--msa` (mask path) | 512 | 11.49 | 1.59 | 1,602 MiB |
+| `--msa --msa-gather` | 512 | **27.08** | **2.13** | **1,350 MiB** |
+| vs tuned dense | | **1.39x** | **1.16x** | |
+
+`-ub 2048` moves the gather to 27.44 / 2.16 (1.41x / 1.17x) for a 5,359 MiB compute buffer — +1.3%
+prefill for 4x the buffer, so `-ub 512` is the better operating point and is what the table quotes.
+
+The row that matters most is the middle one: **the mask path is slower than dense at 64k prefill**
+(11.49 against 19.42). Selecting blocks and then materialising a mask costs more than the sparsity
+saves. Against the path it replaces, the gather is **2.39x prefill and 1.36x decode** — that, not
+the comparison with dense, is what this change is for.
 
 ### The advantage is a long-context advantage
 
 ![advantage vs context](advantage-vs-context.png)
 
-At 16k the prefill gain is 1.02x — essentially nothing. The gathered work is flat in `n_kv` while
-dense attention is not, so the advantage appears with depth.
+At 16k the prefill gain is 1.01x and decode is **0.81x** — at that depth the feature is a net loss
+on decode. The gathered attention is flat in `n_kv` while dense attention is not, so the advantage
+only appears with depth; the crossover sits between 16k and 64k.
 
-**Why dense is quoted at ubatch 2048 and MSA at 512.** A wider ubatch amortises weight streaming
-across more query rows, which is most of dense prefill: dense gains **+24.7% at 16k and +20.5% at
-64k** from `-ub 2048`. MSA gains ~1%, because its prefill kernel is invoked once per query token and
-cannot use the wider batch. Comparing both at 512 would flatter this branch by reporting 1.66x
-instead of 1.38x.
+**Why dense is quoted at its own best ubatch.** A wider ubatch amortises weight streaming across
+more query rows, so dense is measured at whichever `-ub` suits it. On this file that is worth
+**+2.6% at 16k** (48.71 -> 49.99); the 64k figure is not yet measured at `-ub 512` and is not
+claimed here. Quoting each arm at its own best `-ub` is the honest comparison either way.
 
 ### Compute buffer
 
