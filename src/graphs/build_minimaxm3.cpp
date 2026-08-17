@@ -431,6 +431,11 @@ ggml_cgraph* llm_build_context::build_minimaxm3() {
     // Layer-independent subgraphs, shared by every sparse layer; see build_minimaxm3_msa_mask.
     msa_shared msa_sh;
 
+    // Clear the registered local-block arange before rebuilding. Registration happens during the
+    // build below; if a rebuild ever produced a graph without that subgraph, a pointer into the
+    // previous graph would otherwise survive and be patched on the next reuse check.
+    lctx.msa_local_arange = nullptr;
+
     for (int il = 0; il < n_layer; ++il) {
         // MiniMax-M3 MSA: build the block-sparse mask for this layer (nullptr => dense).
         msa_attn_split msa;
