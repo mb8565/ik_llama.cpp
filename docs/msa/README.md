@@ -112,10 +112,22 @@ that there is **no measurable prefill difference at 16k**. Decode is **0.81x**, 
 outside it: at that depth the feature is a real net loss on decode. The gathered attention is flat in `n_kv` while dense attention is not, so the advantage
 only appears with depth; the crossover sits between 16k and 64k.
 
-**Why dense is quoted at its own best ubatch.** A wider ubatch amortises weight streaming across
-more query rows, so dense is measured at whichever `-ub` suits it. On this file that is worth
-**+2.6% at 16k** (48.71 -> 49.99); the 64k figure is not yet measured at `-ub 512` and is not
-claimed here. Quoting each arm at its own best `-ub` is the honest comparison either way.
+**About "dense, tuned", and a way this table flatters the branch.** A wider ubatch amortises weight
+streaming across more query rows. Measured on this file, dense gains **+2.6% prefill at 16k**
+(48.71 -> 49.99) and **+20.8% at 64k** (16.08 -> 19.42) from `-ub 2048`.
+
+But dense's decode moves the other way: at 64k it is **1.98 t/s at `-ub 512` and 1.84 at `-ub
+2048`**, so the `-ub 2048` row quoted above as "dense, tuned" is dense at a setting that is good for
+its prefill and **bad for its decode**. Against dense at its own best *decode* setting the decode
+ratio is **1.08x, not 1.16x**. Both comparisons are below, because neither alone is honest:
+
+| gather `-ub 512` (27.08 / 2.13) vs | prefill | decode |
+|---|---:|---:|
+| dense at its best prefill (`-ub 2048`) | 1.39x | 1.16x |
+| dense at its best decode (`-ub 512`) | 1.68x | **1.08x** |
+
+The prefill advantage is larger than the headline and the decode advantage is smaller. If you tune
+dense for the metric you care about, the decode win is about 8%.
 
 ### Compute buffer
 
