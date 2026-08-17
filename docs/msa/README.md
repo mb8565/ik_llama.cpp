@@ -105,7 +105,7 @@ this branch has nothing to offer you.
 
 ### The advantage is a long-context advantage
 
-![advantage vs context](advantage-vs-context.png)
+![decode vs context](advantage-vs-context.png)
 
 At 16k the prefill gain is 1.01x — that is inside the ±1.1% noise floor, so the honest statement is
 that there is **no measurable prefill difference at 16k**. Decode is **0.81x**, which is well
