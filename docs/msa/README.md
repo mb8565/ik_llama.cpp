@@ -93,8 +93,10 @@ claimed here. Quoting each arm at its own best `-ub` is the honest comparison ei
 
 ![compute buffer](compute-buffer.png)
 
-2,635 MiB at 128k where the mask path's own measured law predicts 34,446 MiB. Still `O(n_kv)` rather
-than flat like dense — something in this path still scales and has not been identified.
+1,350 MiB at 64k, where the mask path's own measured law predicts 17,258 MiB. Still `O(n_kv)`
+rather than flat like dense — something in this path scales and has not been identified. (A 128k
+point of 2,635 MiB was taken earlier against the same law's 34,446 MiB, but not re-measured in this
+configuration, so the chart stops at 64k.)
 
 ---
 
