@@ -55,9 +55,16 @@ and every sparse layer shares.
 
 ## Results
 
-MiniMax-M3 Q4_K_M, CPU-only, dual Xeon Platinum 8260, 376 GB DDR4, `-t 48`. Each arm is the same
+MiniMax-M3 Q4_K_M, CPU-only, dual Xeon Platinum 8260, 376 GB DDR4, `-t 48`, GPUs hidden with
+`CUDA_VISIBLE_DEVICES=""` (`-ngl 0` alone does **not** stop batch-GEMM offload). Each arm is the same
 binary; only the flag differs. Dense is measured at **its own best ubatch (2048)** and MSA at its
 best (512) — see the caveat below, it matters.
+
+**Every number here is a single run, and the measured run-to-run spread on this machine is ±1.1%**
+(three repeats of one identical configuration gave 51.22 / 50.72 / 50.10 t/s). A fourth repeat taken
+immediately after a change of regime came in 18% low, so first-run-after-a-change is discarded.
+Read the 64k ratios, which are 39% and 16%, as real; read anything within a couple of percent as no
+difference.
 
 ![arms at 64k](arms-64k.png)
 
@@ -80,8 +87,9 @@ the comparison with dense, is what this change is for.
 
 ![advantage vs context](advantage-vs-context.png)
 
-At 16k the prefill gain is 1.01x and decode is **0.81x** — at that depth the feature is a net loss
-on decode. The gathered attention is flat in `n_kv` while dense attention is not, so the advantage
+At 16k the prefill gain is 1.01x — that is inside the ±1.1% noise floor, so the honest statement is
+that there is **no measurable prefill difference at 16k**. Decode is **0.81x**, which is well
+outside it: at that depth the feature is a real net loss on decode. The gathered attention is flat in `n_kv` while dense attention is not, so the advantage
 only appears with depth; the crossover sits between 16k and 64k.
 
 **Why dense is quoted at its own best ubatch.** A wider ubatch amortises weight streaming across
