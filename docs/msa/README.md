@@ -83,6 +83,26 @@ The row that matters most is the middle one: **the mask path is slower than dens
 saves. Against the path it replaces, the gather is **2.39x prefill and 1.36x decode** — that, not
 the comparison with dense, is what this change is for.
 
+### What this actually buys: decode that barely cares about context length
+
+| n_kv | dense decode t/s | gather decode t/s | dense prefill | gather prefill |
+|---:|---:|---:|---:|---:|
+| 2,240 | 4.15 | **2.77** | 80.33 | 81.26 |
+| 4,288 | 4.04 | **2.75** | 74.06 | 69.19 |
+| 8,384 | 3.91 | **2.74** | 63.88 | 59.47 |
+| 16,576 | 3.30 | **2.60** | 49.34 | 50.45 |
+| 65,536 | 1.84 | **2.16** | 19.42 | 27.08 |
+
+Read the decode columns down. The gather goes 2.77 -> 2.16, a **22%** fall across a 29x context
+range. Dense goes 4.15 -> 1.84, a **56%** fall. That is the property worth having, and it is not
+what a single ratio conveys: the gather pays a roughly constant ~120 ms/token and in exchange
+decode stops scaling with `n_kv`. The ratio only turns favourable once dense has degraded past that
+fixed cost, which on this model and machine happens somewhere past 16k.
+
+Prefill has its own crossover and the gather is **behind in the middle of the range**: about 7%
+slower at 4k-8k, level at 2k and 16k, ahead only at 64k. If your contexts live between 4k and 16k
+this branch has nothing to offer you.
+
 ### The advantage is a long-context advantage
 
 ![advantage vs context](advantage-vs-context.png)
