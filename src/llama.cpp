@@ -836,6 +836,16 @@ bool llama_context::update_cache_copies() {
         c.cpy->src[1]->data = (char *) kv_self.kr_l[il]->data + c.cpy->view_offs;
         c.cpy->data         = c.cpy->src[1]->data;
     }
+    // MiniMax-M3 MSA: re-point the local-block arange at the CURRENT kv_head. Without this the
+    // force-include targets the block that was current when the graph was built, which inside one
+    // FA pad-256 reuse window is wrong for every step past the next B_k boundary.
+    if (msa_local_arange) {
+        if (msa_local_arange->op != GGML_OP_ARANGE) return false;
+        // op_params[0..2] are start/stop/step as floats (see ggml_arange); the ggml helper that
+        // writes them lives in ggml-impl.h and is not visible here, so write them the same way.
+        ((float *) msa_local_arange->op_params)[0] = (float) kv_self.head;
+        ((float *) msa_local_arange->op_params)[1] = (float) (kv_self.head + msa_local_arange->ne[0]);
+    }
     return patch_dsa_cache_copies();
 }
 

@@ -204,6 +204,10 @@ ggml_tensor * llm_build_context::build_minimaxm3_msa_mask(ggml_cgraph * gf,
       if (!bump) {
         // local block id per token = (kv_head + p) / B_k, p in [0,n_tokens).  {n_tokens}
         ggml_tensor * p = ggml_arange(ctx0, (float) kv_head, (float) (kv_head + n_tokens), 1.0f); // abs slot
+        // kv_head is baked into op_params here; a reused graph would keep the first ubatch's value.
+        // Register so update_cache_copies() can re-point it. One tensor, because this subgraph is
+        // now shared by every sparse layer.
+        lctx.msa_local_arange = p;
         ggml_tensor * lblk = ggml_scale(ctx0, p, 1.0f / (float) B_k);          // (kv_head+p)/B_k (float)
         // floor via step-sum over block-id thresholds: onehot[b,t] = 1 iff floor(lblk[t])==b.
         // Build {n_blocks, n_tokens}: for block id b, indicator (lblk - b in [0,1)).

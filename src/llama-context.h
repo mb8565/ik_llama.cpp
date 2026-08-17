@@ -719,6 +719,16 @@ struct llama_context {
     // per layer here and patch its offset in update_cache_copies(), exactly like K/V.
     std::vector<CacheCopy> msa_cache_copies;
 
+    // MiniMax-M3 MSA: the local-block force-include builds its block id from
+    // ggml_arange(kv_head, kv_head + n_tokens, 1), which BAKES kv_head into op_params at graph
+    // build time. can_reuse_graph() keys on kv_self.n, not on kv_head, and with FA the cache pads
+    // to 256, so one graph serves up to 256 decode steps while kv_head advances. B_k is 128, so
+    // the true local block moves twice inside a window while the baked one never does, and the
+    // reference's force-include of the query's own block silently targets the wrong block for
+    // about half of all decoded tokens. Register the arange here and re-point it in
+    // update_cache_copies(), exactly like the kr_l copy above. Null when MSA is off.
+    ggml_tensor * msa_local_arange = nullptr;
+
     bool update_cache_copies();
 
     bool ensure_dflash_kv_cache_tensors(int32_t cross_ctx);
