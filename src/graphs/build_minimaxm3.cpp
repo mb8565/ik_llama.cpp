@@ -19,7 +19,8 @@
 // dense whenever k*B_k >= n_kv (short context) — the no-op-exact validation hook.
 // =============================================================================
 ggml_tensor * llm_build_context::build_minimaxm3_msa_mask(ggml_cgraph * gf,
-        ggml_tensor * cur, ggml_tensor * inp_pos, ggml_tensor * KQ_mask, int il, msa_attn_split * msa) {
+        ggml_tensor * cur, ggml_tensor * inp_pos, ggml_tensor * KQ_mask, int il, msa_attn_split * msa,
+        ggml_tensor ** cell_table) {
 
     // MSA is off by default; opt in via the --msa CLI flag (cparams.msa). When disabled the
     // minimax-m3 model runs the dense MLA path, byte-identical to not having the feature.
@@ -250,8 +251,15 @@ ggml_tensor * llm_build_context::build_minimaxm3_msa_mask(ggml_cgraph * gf,
         // Cell-id table {B_k, n_blocks} I32. ggml has no I32 arithmetic and ggml_cast cannot make
         // I32 (ggml_compute_forward_dup handles F32/F16/BF16 sources only), so build it the one way
         // the tree already supports: mask_to_index over an all-zero mask returns [0 .. n_kv).
-        ggml_tensor * zero = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_kv_eff, 1), 0.0f);
-        ggml_tensor * table = ggml_mask_to_index(ctx0, zero, (int) n_kv_eff);       // {n_kv,1} I32
+        // The table is 0..n_kv-1 and does not depend on il, so build it once per graph. Rebuilding
+        // it per sparse layer costs 57 redundant O(n_kv) fills and scans, and ~200 extra graph
+        // nodes per evaluation, each carrying its own parallel dispatch and barrier.
+        ggml_tensor * table = cell_table ? *cell_table : nullptr;
+        if (!table) {
+            ggml_tensor * zero = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_kv_eff, 1), 0.0f);
+            table = ggml_mask_to_index(ctx0, zero, (int) n_kv_eff);                 // {n_kv,1} I32
+            if (cell_table) *cell_table = table;
+        }
         table = ggml_reshape_2d(ctx0, table, B_k, n_blocks);                        // {B_k, n_blocks}
         // Selected block ids, contiguous: {topk_blk, HT} -> flat.
         ggml_tensor * sel_blk = ggml_cont(ctx0,
@@ -406,10 +414,14 @@ ggml_cgraph* llm_build_context::build_minimaxm3() {
     ggml_tensor * inp_out_ids = n_tokens > 1 ? build_inp_out_ids() : nullptr;
     ggml_tensor * KQ_mask = build_inp_KQ_mask();
 
+    // Layer-independent, so shared by every sparse layer; see build_minimaxm3_msa_mask.
+    ggml_tensor * msa_cell_table = nullptr;
+
     for (int il = 0; il < n_layer; ++il) {
         // MiniMax-M3 MSA: build the block-sparse mask for this layer (nullptr => dense).
         msa_attn_split msa;
-        ggml_tensor * msa_mask  = build_minimaxm3_msa_mask(gf, inpL, inp_pos, KQ_mask, il, &msa);
+        ggml_tensor * msa_mask  = build_minimaxm3_msa_mask(gf, inpL, inp_pos, KQ_mask, il, &msa,
+                                                           &msa_cell_table);
         ggml_tensor * attn_mask = msa_mask ? msa_mask : KQ_mask;
         ggml_tensor * ffn_inp = build_std_attention(gf, model.layers[il].attn_norm, inpL,
                 inp_pos, il == n_layer - 1 ? inp_out_ids : nullptr, nullptr,

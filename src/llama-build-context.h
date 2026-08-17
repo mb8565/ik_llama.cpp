@@ -450,8 +450,11 @@ struct llm_build_context {
     // MiniMax-M3 MSA: build the block-sparse additive attention mask for sparse layer `il`.
     // Returns nullptr to signal "fall back to the dense KQ_mask" (disabled / non-sparse /
     // indexer tensors absent / cache missing). `cur` is the layer input (pre attn_norm).
+    // `cell_table` caches the layer-independent 0..n_kv index list across the layer loop; pass
+    // the address of a nullptr-initialised local and it is built once per graph, not once per layer.
     ggml_tensor * build_minimaxm3_msa_mask(ggml_cgraph * gf, ggml_tensor * cur,
-            ggml_tensor * inp_pos, ggml_tensor * KQ_mask, int il, msa_attn_split * msa);
+            ggml_tensor * inp_pos, ggml_tensor * KQ_mask, int il, msa_attn_split * msa,
+            ggml_tensor ** cell_table = nullptr);
     // MiniMax-M3 MSA: partial NEOX RoPE on the indexer q/k ({d_idx, n_idx_heads, n_tokens}).
     ggml_tensor * build_minimaxm3_index_rope(ggml_tensor * v, ggml_tensor * inp_pos,
             int64_t n_rot_idx, int64_t d_idx, int64_t n_idx_heads, float idx_freq_base,
