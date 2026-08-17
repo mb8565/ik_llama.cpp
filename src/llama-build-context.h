@@ -56,6 +56,15 @@ struct msa_attn_split {
     int n_gather = 0;
 };
 
+// Subgraphs the MSA mask builder needs that do NOT depend on the layer index. n_kv, n_tokens,
+// kv_head and B_k are graph-level constants, so every sparse layer was building byte-identical
+// copies of these. Built on the first sparse layer and reused by the rest.
+struct msa_shared {
+    ggml_tensor * cell_table = nullptr;   // {n_kv,1} I32, the list 0..n_kv-1
+    ggml_tensor * floor3     = nullptr;   // {n_kv,1,n_tokens} F32, the causal floor
+    ggml_tensor * bump       = nullptr;   // {n_blocks,1,n_tokens} F32, local-block force-include
+};
+
 struct llm_build_context {
     const llama_model    & model;
           llama_context  & lctx;
@@ -450,11 +459,11 @@ struct llm_build_context {
     // MiniMax-M3 MSA: build the block-sparse additive attention mask for sparse layer `il`.
     // Returns nullptr to signal "fall back to the dense KQ_mask" (disabled / non-sparse /
     // indexer tensors absent / cache missing). `cur` is the layer input (pre attn_norm).
-    // `cell_table` caches the layer-independent 0..n_kv index list across the layer loop; pass
-    // the address of a nullptr-initialised local and it is built once per graph, not once per layer.
+    // `shared` caches the layer-independent subgraphs across the layer loop; pass the address of a
+    // default-constructed msa_shared and they are built once per graph, not once per sparse layer.
     ggml_tensor * build_minimaxm3_msa_mask(ggml_cgraph * gf, ggml_tensor * cur,
             ggml_tensor * inp_pos, ggml_tensor * KQ_mask, int il, msa_attn_split * msa,
-            ggml_tensor ** cell_table = nullptr);
+            msa_shared * shared = nullptr);
     // MiniMax-M3 MSA: partial NEOX RoPE on the indexer q/k ({d_idx, n_idx_heads, n_tokens}).
     ggml_tensor * build_minimaxm3_index_rope(ggml_tensor * v, ggml_tensor * inp_pos,
             int64_t n_rot_idx, int64_t d_idx, int64_t n_idx_heads, float idx_freq_base,

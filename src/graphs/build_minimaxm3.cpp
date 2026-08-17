@@ -20,7 +20,7 @@
 // =============================================================================
 ggml_tensor * llm_build_context::build_minimaxm3_msa_mask(ggml_cgraph * gf,
         ggml_tensor * cur, ggml_tensor * inp_pos, ggml_tensor * KQ_mask, int il, msa_attn_split * msa,
-        ggml_tensor ** cell_table) {
+        msa_shared * shared) {
 
     // MSA is off by default; opt in via the --msa CLI flag (cparams.msa). When disabled the
     // minimax-m3 model runs the dense MLA path, byte-identical to not having the feature.
@@ -150,12 +150,18 @@ ggml_tensor * llm_build_context::build_minimaxm3_msa_mask(ggml_cgraph * gf,
     // upcast the causal-floor view to F32. Off the FA path KQ_mask is already F32 (cast is a no-op
     // copy here, removed below by reusing the original when types match).
     const float BIG = 1e30f;
-    ggml_tensor * floor3 = ggml_view_2d(ctx0, KQ_mask, n_kv_eff, n_tokens, KQ_mask->nb[1], 0);
-    floor3 = ggml_cont(ctx0, floor3);
-    if (floor3->type != GGML_TYPE_F32) {
-        floor3 = ggml_cast(ctx0, floor3, GGML_TYPE_F32);
+    // KQ_mask, n_kv and n_tokens are graph-level constants, so this chain is identical for every
+    // sparse layer; build it on the first one and reuse.
+    ggml_tensor * floor3 = shared ? shared->floor3 : nullptr;
+    if (!floor3) {
+        floor3 = ggml_view_2d(ctx0, KQ_mask, n_kv_eff, n_tokens, KQ_mask->nb[1], 0);
+        floor3 = ggml_cont(ctx0, floor3);
+        if (floor3->type != GGML_TYPE_F32) {
+            floor3 = ggml_cast(ctx0, floor3, GGML_TYPE_F32);
+        }
+        floor3 = ggml_reshape_3d(ctx0, floor3, n_kv_eff, 1, n_tokens); // {n_kv,1,n_tok} F32
+        if (shared) shared->floor3 = floor3;
     }
-    floor3 = ggml_reshape_3d(ctx0, floor3, n_kv_eff, 1, n_tokens); // {n_kv,1,n_tok} F32
     // Defense-in-depth for the indexer-key clamp above: clamp the raw indexer scores to a finite range
     // BEFORE adding the causal floor. With finite scores, score + (-inf causal) = -inf (clean), so
     // a stale/padding cell can never reach the block-max-pool as NaN. (The key clamp above already
@@ -194,6 +200,8 @@ ggml_tensor * llm_build_context::build_minimaxm3_msa_mask(ggml_cgraph * gf,
     // We add +BIG to block (pos//B_k) for every (head, token). Build a {n_blocks, n_tokens} bump
     // via a one-hot over the local block id, broadcast over idx_heads.
     if (hparams.minimax_sparse_local_block) {
+      ggml_tensor * bump = shared ? shared->bump : nullptr;
+      if (!bump) {
         // local block id per token = (kv_head + p) / B_k, p in [0,n_tokens).  {n_tokens}
         ggml_tensor * p = ggml_arange(ctx0, (float) kv_head, (float) (kv_head + n_tokens), 1.0f); // abs slot
         ggml_tensor * lblk = ggml_scale(ctx0, p, 1.0f / (float) B_k);          // (kv_head+p)/B_k (float)
@@ -212,9 +220,11 @@ ggml_tensor * llm_build_context::build_minimaxm3_msa_mask(ggml_cgraph * gf,
         ggml_tensor * onehot = ggml_sub(ctx0,
                 ggml_step(ctx0, ggml_add1(ctx0, diff, ggml_new_f32(ctx0,  1e-4f))),
                 ggml_step(ctx0, ggml_add1(ctx0, diff, ggml_new_f32(ctx0, -1.0f + 1e-4f))));
-        ggml_tensor * bump = ggml_scale(ctx0, onehot, BIG);                    // {n_blocks, n_tokens}
+        bump = ggml_scale(ctx0, onehot, BIG);                                  // {n_blocks, n_tokens}
         bump = ggml_reshape_3d(ctx0, bump, n_blocks, 1, n_tokens);             // broadcast over idx_heads
-        blk = ggml_add(ctx0, blk, bump);
+        if (shared) shared->bump = bump;
+      }
+      blk = ggml_add(ctx0, blk, bump);
     }
 
     // --- per-idx-head top-k block selection -> additive block penalty {n_blocks, idx_heads, n_tokens} ---
@@ -254,11 +264,11 @@ ggml_tensor * llm_build_context::build_minimaxm3_msa_mask(ggml_cgraph * gf,
         // The table is 0..n_kv-1 and does not depend on il, so build it once per graph. Rebuilding
         // it per sparse layer costs 57 redundant O(n_kv) fills and scans, and ~200 extra graph
         // nodes per evaluation, each carrying its own parallel dispatch and barrier.
-        ggml_tensor * table = cell_table ? *cell_table : nullptr;
+        ggml_tensor * table = shared ? shared->cell_table : nullptr;
         if (!table) {
             ggml_tensor * zero = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_kv_eff, 1), 0.0f);
             table = ggml_mask_to_index(ctx0, zero, (int) n_kv_eff);                 // {n_kv,1} I32
-            if (cell_table) *cell_table = table;
+            if (shared) shared->cell_table = table;
         }
         table = ggml_reshape_2d(ctx0, table, B_k, n_blocks);                        // {B_k, n_blocks}
         // Selected block ids, contiguous: {topk_blk, HT} -> flat.
@@ -414,14 +424,14 @@ ggml_cgraph* llm_build_context::build_minimaxm3() {
     ggml_tensor * inp_out_ids = n_tokens > 1 ? build_inp_out_ids() : nullptr;
     ggml_tensor * KQ_mask = build_inp_KQ_mask();
 
-    // Layer-independent, so shared by every sparse layer; see build_minimaxm3_msa_mask.
-    ggml_tensor * msa_cell_table = nullptr;
+    // Layer-independent subgraphs, shared by every sparse layer; see build_minimaxm3_msa_mask.
+    msa_shared msa_sh;
 
     for (int il = 0; il < n_layer; ++il) {
         // MiniMax-M3 MSA: build the block-sparse mask for this layer (nullptr => dense).
         msa_attn_split msa;
         ggml_tensor * msa_mask  = build_minimaxm3_msa_mask(gf, inpL, inp_pos, KQ_mask, il, &msa,
-                                                           &msa_cell_table);
+                                                           &msa_sh);
         ggml_tensor * attn_mask = msa_mask ? msa_mask : KQ_mask;
         ggml_tensor * ffn_inp = build_std_attention(gf, model.layers[il].attn_norm, inpL,
                 inp_pos, il == n_layer - 1 ? inp_out_ids : nullptr, nullptr,
