@@ -136,6 +136,12 @@ gather's grows about 2.4x more slowly, so the penalty it pays shrinks as context
 |---|---:|---:|---:|---:|---:|
 | gather decode minus dense decode, ms/token | +120 | +116 | +109 | +82 | **-36** |
 
+Every cell above is **derived** from the two decode columns of the previous table --
+`1000/gather - 1000/dense` -- and is in no log. The 2.4x is the ratio of the two arms' slopes over
+the 8,384 -> 65,600 chord: 4.36e-3 against 1.83e-3 ms per kv token. Dense is not linear below 8k
+(its 2,240 -> 8,384 slope is 2.41e-3), so that chord is the honest place to take a slope and the
+crossover implied by it is an extrapolation, not a measurement.
+
 The penalty is about 120 ms at the short end and is **not** fixed; describing it as a fixed cost
 overstates the gather at low context and understates it at high. The crossover is where that
 column changes sign, which is somewhere between 16k and 64k.
