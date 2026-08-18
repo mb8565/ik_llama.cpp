@@ -100,8 +100,15 @@ bool iqk_fa_gather_kv_split(int int_type_k, int int_type_v, int Dk, int Dv, int 
                 S += expf(s - M);
             }
         }
-        float norm = S > 0 ? 1/S : 1;
-        for (int i = 0; i < Dv; ++i) Racc[i] *= norm;
+        // Every partial can be -inf if the caller's index list selects only masked cells, and then
+        // accumulate_qkv never writes Racc. Store zeros, which is what normalize_and_store_1row
+        // does for S <= 0 and what this path produced before the split.
+        if (S > 0) {
+            float norm = 1/S;
+            for (int i = 0; i < Dv; ++i) Racc[i] *= norm;
+        } else {
+            std::memset(Racc, 0, Dv*sizeof(float));
+        }
     }
     return true;
 }
