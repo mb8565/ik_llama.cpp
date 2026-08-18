@@ -8,6 +8,11 @@ those scores into blocks of 128, and attends only the top 16 blocks per index he
 This branch stops turning that answer into a mask. It also fixes a correctness bug that affects the
 previous `minimax-msa` branch.
 
+For context: `main` supports the architecture but not this mechanism. Its
+`src/graphs/build_minimaxm3.cpp` is 69 lines with no indexer, no block selection and no top-k, and
+there are no MSA options in `common/common.h`, so MiniMax-M3 runs dense there. Everything below is
+about the sparse path, which is opt-in and off by default.
+
 ---
 
 ## Correctness fix: the local block was selected from a stale `kv_head`
