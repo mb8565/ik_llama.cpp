@@ -22370,18 +22370,22 @@ static void ggml_compute_forward_pool_1d_sk_p0(
 
     assert(src->type == GGML_TYPE_F32 || src->type == GGML_TYPE_F16);
 
-    if (params->ith != 0) {
-        return;
-    }
-
-    const char * cdata = (const char *)src->data;
-    const char * const data_end = cdata + ggml_nbytes(src);
-    float * drow = (float *)dst->data;
+    const int ith = params->ith;
+    const int nth = params->nth;
 
     const int64_t rs = dst->ne[0];
+    const int64_t nr = ggml_nrows(src);
 
-    while (cdata < data_end) {
-        const void * srow = (const void *)cdata;
+    // rows per thread
+    const int64_t dr = (nr + nth - 1)/nth;
+
+    // row range for this thread
+    const int64_t ir0 = dr*ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const void * srow = (const void *)((const char *)src->data + ir*src->nb[1]);
+        float * drow = (float *)((char *)dst->data + ir*dst->nb[1]);
         int j = 0;
         for (int64_t i = 0; i < rs; ++i) {
             switch (op) {
@@ -22404,9 +22408,6 @@ static void ggml_compute_forward_pool_1d_sk_p0(
                 case GGML_OP_POOL_COUNT: GGML_ABORT("fatal error");
             }
         }
-
-        cdata += src->nb[1];
-        drow  += rs;
     }
 }
 
@@ -28817,6 +28818,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 n_tasks = n_threads;
             } break;
         case GGML_OP_POOL_1D:
+            {
+                n_tasks = n_threads;
+            } break;
         case GGML_OP_POOL_2D:
             {
                 n_tasks = 1;
