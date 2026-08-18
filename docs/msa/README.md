@@ -174,8 +174,9 @@ change.
 At matched `-ub 512` dense's buffer is flat, 402.75 MiB at both 16k and 64k, while the gather's
 goes 402.75 -> 1,350.49. So at equal context and ubatch **the gather uses 3.4x dense's buffer at
 64k**. The term that scales is the indexer score tensor, `{n_kv, idx_heads, n_tokens}` F32, and the
-floor-add output of the same shape: at `n_kv` 65,536 and `-ub 512` each is
-65,536 x 4 x 512 x 4 B = **512 MiB**. Two of those on top of the 403 MiB floor accounts for the
+floor-add output of the same shape: at `n_kv` ~65,600 and `-ub 512` each is
+65,536 x 4 x 512 x 4 B = **512 MiB** (rounding n_kv down to the power of two; the padded value
+adds under half a percent). Two of those on top of the 403 MiB floor accounts for the
 measured 1,350 to within the slack the graph allocator has to reuse. That is arithmetic from the
 shapes, not a measurement of the allocation plan, so treat it as the identification of the growing
 term rather than a breakdown of the peak. A 128k point of 2,635 MiB exists but was not re-measured
