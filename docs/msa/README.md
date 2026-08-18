@@ -123,9 +123,17 @@ change is discarded.
 ![decode vs context](advantage-vs-context.png)
 
 Read the decode columns down. The gather falls **23%** across a 29x context range where dense falls
-**52%**. That is the property, and a single ratio does not convey it: the gather pays about
-120 ms/token and in exchange its decode barely moves with `n_kv`. The ratio turns favourable only
-once dense has degraded past that fixed cost, which here is somewhere past 16k.
+**52%**. That is the property, and a single ratio does not convey it. Both arms carry a cost that
+grows with `n_kv` -- the gather still scores every cached token with the indexer -- but the
+gather's grows about 2.4x more slowly, so the penalty it pays shrinks as context grows:
+
+| n_kv | 2,240 | 4,288 | 8,384 | 16,576 | 65,600 |
+|---|---:|---:|---:|---:|---:|
+| gather decode minus dense decode, ms/token | +120 | +116 | +109 | +82 | **-36** |
+
+The penalty is about 120 ms at the short end and is **not** fixed; describing it as a fixed cost
+overstates the gather at low context and understates it at high. The crossover is where that
+column changes sign, which is somewhere between 16k and 64k.
 
 **Below that it is a net loss.** Prefill is ~7% slower at 4k-8k and within noise at 2k (+1.2%) and
 16k (+2.3%); decode is **0.79x** at 16k, well outside the noise floor. If your contexts live between 4k and 16k this
@@ -199,7 +207,9 @@ to both greedy text and ordinary batched perplexity.
   every MSA arm lands between 30 and 34. MSA nearly doubles backend graph splits (1410 vs 774) and
   each split is a synchronisation. Use dense there.
 - **It is a net loss below about 16k.** Prefill is ~7% slower at 4k-8k, and decode is 0.79x at 16k.
-  The fixed per-token cost dominates until dense has degraded past it.
+  The indexer scores every cached token on every decoded token, so the sparse path has its own
+  O(n_kv) cost; it is smaller than dense's, which is why the two curves cross, but it is not zero
+  and the penalty below the crossover is real.
 - **Decode gather is off inside this flag's fast path only where it is safe**; the largest remaining
   CPU lever is untouched — the prefill kernel is called once per query token, making every sparse
   GEMM only 16 rows wide.
