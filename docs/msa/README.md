@@ -4,7 +4,67 @@ MiniMax-M3's sparse attention (MSA) scores every cached token against four index
 those scores into blocks of 128, and attends only the top 16 blocks per index head. The answer to
 "which cells does this query attend" is therefore **16 block ids** — about 64 bytes.
 
-This branch stops turning that answer into a mask.
+This branch stops turning that answer into a mask. It also fixes a correctness bug that affects the
+previous `minimax-msa` branch.
+
+---
+
+## Correctness fix: the local block was selected from a stale `kv_head`
+
+**This affects the earlier `minimax-msa` branch (`891a963c`) and anyone running `--msa` from it.**
+
+The reference implementation force-includes the query's own block in the top-k selection
+(`block_scores.scatter_(q_block, +inf)`). The block id is built with
+
+```c
+ggml_arange(ctx0, (float) kv_head, (float) (kv_head + n_tokens), 1.0f);
+```
+
+`ggml_arange` stores `start` and `stop` in `op_params` when the **graph is built**, and the CPU
+kernel reads them back at execution. That is fine as long as the graph is rebuilt whenever
+`kv_head` moves — but `can_reuse_graph()` keys on `kv_self.n`, not on `kv_head`, and with
+flash-attention the KV cache pads to 256. So one graph serves up to 256 decode steps while
+`kv_head` advances through them, and `update_cache_copies()` re-points the indexer-key cache write
+but not this arange.
+
+`B_k` is 128. Inside a single 256-step reuse window the true local block therefore advances twice
+while the baked one never moves: **the query's own block is force-included at the wrong index for
+roughly half of all decoded tokens.** Graph reuse is on by default.
+
+### How it was measured
+
+Same model, same 16k prompt, greedy, `--temp 0`, fixed seed, 400 generated tokens, comparing
+`-gr` (default) against `-no-gr`:
+
+| arm | before the fix | after |
+|---|---|---|
+| `--msa --msa-gather` | **outputs diverge**, first difference near token 150 | identical |
+| `--msa` (mask path) | identical in this sample | identical |
+| dense | identical | identical |
+
+Dense being clean rules out a general graph-reuse fault. The mask path not diverging in one sample
+is weak evidence of anything — the divergence is a low-probability event — and the same stale
+arange is in that path, so it should be assumed affected.
+
+A first attempt to test this reported no difference and was wrong: it ran at `ctx 8192` with a
+short prompt, where roughly four KV blocks are non-empty against a 16-block budget, so every block
+is selected regardless and the force-include cannot matter. The table above uses a prompt long
+enough that 125 blocks contend for 16 slots.
+
+### The fix
+
+Register the arange at build time and re-point it in `update_cache_copies()`, mirroring the `kr_l`
+cache-copy fixup that sits a few lines above it in the same function and exists for exactly this
+failure mode on the indexer-key write:
+
+```c
+((float *) msa_local_arange->op_params)[0] = (float) kv_self.head;
+((float *) msa_local_arange->op_params)[1] = (float) (kv_self.head + msa_local_arange->ne[0]);
+```
+
+Verified on a matched pair — the configuration that diverged before is byte-identical after — and
+on a second, independent prompt. Note that varying `--seed` does **not** vary this test: `--temp 0`
+is greedy, so the seed is never read.
 
 ---
 
@@ -168,7 +228,8 @@ to both greedy text and ordinary batched perplexity.
 - **No help on hybrid GPU.** With 8 of 61 layers on four P100s, dense reaches 53.37 t/s prefill and
   every MSA arm lands between 30 and 34. MSA nearly doubles backend graph splits (1410 vs 774) and
   each split is a synchronisation. Use dense there.
-- **Nothing at short context.** 1.02x at 16k.
+- **It is a net loss below about 16k.** Prefill is ~7% slower at 4k-8k, and decode is 0.81x at 16k.
+  The fixed per-token cost dominates until dense has degraded past it.
 - **Decode gather is off inside this flag's fast path only where it is safe**; the largest remaining
   CPU lever is untouched — the prefill kernel is called once per query token, making every sparse
   GEMM 16 wide, roughly 1.31x under its arithmetic roofline.
