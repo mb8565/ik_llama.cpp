@@ -14,58 +14,44 @@ previous `minimax-msa` branch.
 
 **This affects the earlier `minimax-msa` branch (`891a963c`) and anyone running `--msa` from it.**
 
-The reference implementation force-includes the query's own block in the top-k selection
-(`block_scores.scatter_(q_block, +inf)`). The block id is built with
+The reference force-includes the query's own block in the top-k selection
+(`block_scores.scatter_(q_block, +inf)`). The block id comes from
+`ggml_arange(ctx0, (float) kv_head, (float) (kv_head + n_tokens), 1.0f)`, and `ggml_arange` stores
+`start`/`stop` in `op_params` when the **graph is built**. That is fine if the graph is rebuilt
+whenever `kv_head` moves — but `can_reuse_graph()` keys on `kv_self.n`, not `kv_head`, flash
+attention pads the cache to 256, and `update_cache_copies()` re-points the indexer-key write but
+not this arange. `B_k` is 128, so inside one 256-step reuse window the true local block advances
+twice while the baked one never moves: **the query's own block is force-included at the wrong index
+for roughly half of all decoded tokens.** Graph reuse is on by default.
 
-```c
-ggml_arange(ctx0, (float) kv_head, (float) (kv_head + n_tokens), 1.0f);
-```
-
-`ggml_arange` stores `start` and `stop` in `op_params` when the **graph is built**, and the CPU
-kernel reads them back at execution. That is fine as long as the graph is rebuilt whenever
-`kv_head` moves — but `can_reuse_graph()` keys on `kv_self.n`, not on `kv_head`, and with
-flash-attention the KV cache pads to 256. So one graph serves up to 256 decode steps while
-`kv_head` advances through them, and `update_cache_copies()` re-points the indexer-key cache write
-but not this arange.
-
-`B_k` is 128. Inside a single 256-step reuse window the true local block therefore advances twice
-while the baked one never moves: **the query's own block is force-included at the wrong index for
-roughly half of all decoded tokens.** Graph reuse is on by default.
-
-### How it was measured
-
-Same model, same 16k prompt, greedy, `--temp 0`, fixed seed, 400 generated tokens, comparing
-`-gr` (default) against `-no-gr`:
+**Measured.** Same model, 16k prompt, greedy, `--temp 0`, fixed seed, 400 tokens, `-gr` against
+`-no-gr`:
 
 | arm | before the fix | after |
 |---|---|---|
 | `--msa --msa-gather` | **outputs diverge**, first difference near token 375 of 400 | identical |
 | `--msa` (mask path) | identical in this sample | identical |
-| dense | identical | identical |
+| dense | identical | not re-run (the fix cannot reach dense) |
 
-Dense being clean rules out a general graph-reuse fault. The mask path not diverging in one sample
-is weak evidence of anything — the divergence is a low-probability event — and the same stale
-arange is in that path, so it should be assumed affected.
+Dense being clean rules out a general graph-reuse fault. The mask path carries the same stale
+arange and should be assumed affected — one non-diverging sample is weak evidence, since the
+divergence is a low-probability event that appears late in the generation. Two things make a test
+of this useless: a short `-n`, and a small context. At `ctx 8192` with a short prompt roughly four
+KV blocks are non-empty against a 16-block budget, so every block is selected regardless and the
+force-include cannot matter.
 
-A test at `ctx 8192` with a short prompt has no power: roughly four KV blocks are non-empty
-against a 16-block budget, so every block is selected regardless and the force-include cannot
-matter. A null there is not evidence. The table above uses a prompt long enough that 125 blocks
-contend for 16 slots, and the divergence appears late in the generation — a short `-n` will miss it.
-
-### The fix
-
-Register the arange at build time and re-point it in `update_cache_copies()`, mirroring the `kr_l`
-cache-copy fixup that sits a few lines above it in the same function and exists for exactly this
-failure mode on the indexer-key write:
+**The fix** registers the arange at build time and re-points it in `update_cache_copies()`,
+mirroring the `kr_l` cache-copy fixup a few lines above that exists for exactly this failure mode
+on the indexer-key write:
 
 ```c
 ((float *) msa_local_arange->op_params)[0] = (float) kv_self.head;
 ((float *) msa_local_arange->op_params)[1] = (float) (kv_self.head + msa_local_arange->ne[0]);
 ```
 
-Verified on a matched pair — the configuration that diverged before is byte-identical after — and
-on a second, independent prompt. Note that varying `--seed` does **not** vary this test: `--temp 0`
-is greedy, so the seed is never read.
+Verified on a matched pair — the configuration that diverged is byte-identical after — and on a
+second, independent prompt. Varying `--seed` does **not** vary this test: `--temp 0` is greedy, so
+the seed is never read.
 
 ---
 
@@ -116,102 +102,66 @@ and every sparse layer shares.
 
 ## Results
 
-MiniMax-M3 Q4_K_M, CPU-only, dual Xeon Platinum 8260, 376 GB DDR4, `-t 48`, GPUs hidden with
-`CUDA_VISIBLE_DEVICES=""` (`-ngl 0` alone does **not** stop batch-GEMM offload). Each arm is the same
-binary; only the flag differs. Dense is measured at **its own best ubatch (2048)** and MSA at its
-best (512) — see the caveat below, it matters.
+MiniMax-M3 Q4_K_M, CPU-only, dual Xeon Platinum 8260, `-t 48`, GPUs hidden with
+`CUDA_VISIBLE_DEVICES=""` (`-ngl 0` alone does **not** stop batch-GEMM offload).
+**All rows `-ub 512` for both arms.** Rows up to 16,576 use `-ntg 192`; the 65,600 row uses
+`-ntg 64`, which does not affect prefill and changes the decode average by well under a percent.
 
-**Every number here is a single run, and the measured run-to-run spread on this machine is ±1.1%**
-(three interleaved runs of the same configuration, across two builds already shown to be
-output-identical, gave 51.22 / 50.72 / 50.10 t/s — so a difference of two runs is consistent with
-zero out to about ±2.2%). A fourth run taken
-immediately after a change of regime came in 18% low, so first-run-after-a-change is discarded.
-Read the 64k ratios, which are 39% and 16%, as real; read anything within a couple of percent as no
-difference.
+Every number is a single run. Measured spread is ±1.1% (three interleaved runs of one configuration
+across two builds already shown to be output-identical gave 51.22 / 50.72 / 50.10 t/s), so a
+difference of two runs is consistent with zero out to about ±2.2%. A fourth run taken immediately after a change of regime came in 18% low; first-run-after-a-
+change is discarded.
 
-![arms at 64k](arms-64k.png)
-
-| 64k, npp 65536 / ntg 64 | `-ub` | prefill t/s | decode t/s | compute buffer |
-|---|---:|---:|---:|---:|
-| dense, tuned | 2048 | 19.42 | 1.84 | 1,611 MiB |
-| `--msa` (mask path) | 512 | 11.49 | 1.59 | 1,602 MiB |
-| `--msa --msa-gather` | 512 | **27.08** | **2.13** | **1,350 MiB** |
-| vs tuned dense | | **1.39x** | **1.16x** | |
-
-`-ub 2048` moves the gather to 27.44 / 2.16 (1.41x / 1.17x) for a 5,359 MiB compute buffer — +1.3%
-prefill for 4x the buffer, so `-ub 512` is the better operating point and is what the table quotes.
-
-The row that matters most is the middle one: **the mask path is slower than dense at 64k prefill**
-(11.49 against 19.42). Selecting blocks and then materialising a mask costs more than the sparsity
-saves. Against the path it replaces, at the same `-ub 512`, the gather is **2.36x prefill and
-1.34x decode** — that, not
-the comparison with dense, is what this change is for.
-
-### What this actually buys: decode that barely cares about context length
-
-| n_kv | dense decode t/s | gather decode t/s | dense prefill | gather prefill |
+| n_kv | dense decode | gather decode | dense prefill | gather prefill |
 |---:|---:|---:|---:|---:|
 | 2,240 | 4.15 | **2.77** | 80.33 | 81.26 |
 | 4,288 | 4.04 | **2.75** | 74.06 | 69.19 |
 | 8,384 | 3.91 | **2.74** | 63.88 | 59.47 |
 | 16,576 | 3.30 | **2.60** | 49.34 | 50.45 |
-| 65,536 | 1.98 | **2.13** | 16.08 | 27.08 |
-
-All rows are `-ub 512` for both arms. Read the decode columns down: the gather goes 2.77 -> 2.13,
-a **23%** fall across a 29x context range, where dense goes 4.15 -> 1.98, a **52%** fall. That is the property worth having, and it is not
-what a single ratio conveys: the gather pays a roughly constant ~120 ms/token and in exchange
-decode falls far more slowly than dense's. The ratio only turns favourable once dense has degraded past that
-fixed cost, which on this model and machine happens somewhere past 16k.
-
-Prefill has its own crossover and the gather is **behind in the middle of the range**: about 7%
-slower at 4k-8k, level at 2k and 16k, ahead only at 64k. If your contexts live between 4k and 16k
-this branch has nothing to offer you.
-
-### The advantage is a long-context advantage
+| 65,600 | 1.98 | **2.13** | 16.08 | 27.08 |
 
 ![decode vs context](advantage-vs-context.png)
 
-At 16k the prefill difference is consistent with zero given that floor (1.02x in one pair, 0.99x in
-another), so the honest statement is that there is **none measurable**. Decode is **0.79x**, well
-outside it: at that depth the feature is a real net loss on decode. The gathered attention is
-nearly flat in `n_kv` while dense attention is not, so the advantage only appears with depth; the
-crossover sits between 16k and 64k.
+Read the decode columns down. The gather falls **23%** across a 29x context range where dense falls
+**52%**. That is the property, and a single ratio does not convey it: the gather pays about
+120 ms/token and in exchange its decode barely moves with `n_kv`. The ratio turns favourable only
+once dense has degraded past that fixed cost, which here is somewhere past 16k.
 
-**About "dense, tuned", and a way this table flatters the branch.** A wider ubatch amortises weight
-streaming across more query rows. Measured on this file, dense gains **+2.6% prefill at 16k**
-(48.71 -> 49.99) and **+20.8% at 64k** (16.08 -> 19.42) from `-ub 2048`.
+**Below that it is a net loss.** Prefill is ~7% slower at 4k-8k and within noise at 2k (+1.2%) and
+16k (+2.3%); decode is **0.79x** at 16k, well outside the noise floor. If your contexts live between 4k and 16k this
+branch has nothing to offer you.
 
-But dense's decode moves the other way: at 64k it is **1.98 t/s at `-ub 512` and 1.84 at `-ub
-2048`**, so the `-ub 2048` row quoted above as "dense, tuned" is dense at a setting that is good for
-its prefill and **bad for its decode**. Against dense at its own best *decode* setting the decode
-ratio is **1.08x, not 1.16x**. Both comparisons are below, because neither alone is honest:
+**Ubatch, and how the choice can flatter either arm.** Dense's own best prefill is `-ub 2048`
+(19.42 at 64k, +20.8%), but that setting costs it decode (1.84 against 1.98 at `-ub 512`). So:
 
 | gather `-ub 512` (27.08 / 2.13) vs | prefill | decode |
 |---|---:|---:|
 | dense at its best prefill (`-ub 2048`) | 1.39x | 1.16x |
-| dense at its best decode (`-ub 512`) | 1.68x | **1.08x** |
+| dense at its best decode (`-ub 512`) | **1.68x** | **1.08x** |
 
-The prefill advantage is larger than the headline and the decode advantage is smaller. If you tune
-dense for the metric you care about, the decode win is about 8%.
+Quoting only the first row would understate prefill and overstate decode. Tuned for the metric you
+care about, the decode win is about 8%. (`-ub 2048` moves the gather to 27.44 / 2.16 for a
+5,359 MiB buffer — +1.3% prefill for 4x the memory, so 512 is the operating point.)
+
+**Against the path it replaces.** The mask path at 64k is 11.49 prefill / 1.59 decode — *slower
+than dense at prefill*, because selecting blocks and then materialising a mask costs more than the
+sparsity saves. At matched `-ub 512` the cell list is **2.36x its prefill and 1.34x its decode**.
+That comparison, not the one with dense, is what this change is for.
 
 ### Compute buffer
 
 ![compute buffer](compute-buffer.png)
 
-1,350 MiB at 64k. The **original wide-mask** implementation's measured law
-(`0.262268 x n_kv + 70 MiB`) predicts 17,258 MiB there — but that is not the arm this document
-benchmarks. The parent commit's per-GQA split already brought the shipped mask path to
-**1,601.57 MiB** at 64k, so the like-for-like saving from the cell list is **16%
-(1,602 -> 1,350), not 12.8x**. Most of the growth was removed by the split, not by this change.
+1,350 MiB at 64k. The **original wide-mask** law (`0.262268 x n_kv + 70 MiB`) predicts 17,258 MiB
+there, but that is not the arm this document benchmarks: the parent commit's per-GQA split had
+already brought the shipped mask path to **1,601.57 MiB**. The like-for-like saving is therefore
+**16% (1,602 -> 1,350), not 12.8x** — most of the growth was removed by the split, not by this
+change.
 
-At a matched `-ub 512`, dense's compute buffer is flat: 402.75 MiB at both 16k and 64k. The
-gather's goes 402.75 -> 1,350.49 over the same span. So at equal context and equal ubatch the
-gather's buffer is **3.4x dense's at 64k**, and something in this path still scales with `n_kv`
-that has not been identified. (Quoting dense at `-ub 2048`, where its buffer is 1,611 MiB, would
-make the gather look smaller; that is a different ubatch and not a fair comparison.)
-
-A 128k point of 2,635 MiB was taken earlier against the same law's 34,446 MiB, but not re-measured
-in this configuration, so the chart stops at 64k.
+At matched `-ub 512` dense's buffer is flat, 402.75 MiB at both 16k and 64k, while the gather's
+goes 402.75 -> 1,350.49. So at equal context and ubatch **the gather uses 3.4x dense's buffer at
+64k**, and something in this path still scales with `n_kv` that has not been identified. A 128k
+point of 2,635 MiB exists but was not re-measured in this configuration, so the chart stops at 64k.
 
 ---
 
