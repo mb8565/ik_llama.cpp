@@ -8491,7 +8491,9 @@ struct llama_context * llama_init_from_model(
     cparams.msa_top_k        = params.msa_top_k;
     cparams.msa_split_gqa    = params.msa_split_gqa;
     cparams.msa_gather       = params.msa_gather;
-    cparams.msa_dense_frac   = params.msa_dense_frac;
+    // The CLI clamps this, but the C API does not go through it: a negative value would make
+    // topk_blk >= frac*n_blocks always true and silently disable MSA with no warning.
+    cparams.msa_dense_frac   = std::max(0.0f, std::min(1.0f, params.msa_dense_frac));
     cparams.attn_max_batch   = params.attn_max_batch;
     cparams.fused_moe_up_gate= params.fused_moe_up_gate;
     cparams.grouped_expert_routing = params.grouped_expert_routing;

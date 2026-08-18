@@ -105,8 +105,12 @@ ggml_tensor * llm_build_context::build_minimaxm3_msa_mask(ggml_cgraph * gf,
     // --- write this batch's index keys into the persistent cache at kv_head, read back n_kv ---
     // ROBUSTNESS hardening: clamp the index keys to a safe finite F16 range BEFORE the cache write.
     // On a low-bit base (IQ2_M) the indexer RMSNorm output can saturate to F16 +/-inf (|x|>65504) for
-    // some tokens; an inf in kr_l makes a later mul_mat +/-inf, and inf + causal_floor(-inf) = NaN,
-    // which POOL_MAX keeps and argsort ranks ahead of real blocks. This clamp removes that hazard.
+    // some tokens; an inf in kr_l makes a later mul_mat +/-inf. A +inf in a LIVE cell survives the
+    // block-max pool and ranks that block first, which is the hazard this removes. (An earlier
+    // version of this comment said the danger was NaN surviving the pool. It is not: POOL_MAX
+    // initialises to -FLT_MAX and tests `srow_j > drow[i]` (ggml.c), and every comparison against
+    // NaN is false, so the pool DROPS NaN. Note also that ggml_clamp maps NaN to `max`, because
+    // MIN/MAX are ternaries -- so a clamp is a NaN promoter, not a NaN guard.)
     // NOTE: this is unrelated to the FA -ub128 graph-reuse bug fixed just below (that was a
     // stride/offset bug zeroing recent indexer-key cells, no inf/NaN involved) -- this clamp is
     // defensive only and is a NO-OP on the shipping soft_max path (real keys are well within range).
@@ -201,11 +205,14 @@ ggml_tensor * llm_build_context::build_minimaxm3_msa_mask(ggml_cgraph * gf,
         blk = ggml_reshape_3d(ctx0, sc2, B_k, n_blocks, HT);
     }
     blk = ggml_pool_1d(ctx0, blk, GGML_OP_POOL_MAX, B_k, B_k, 0);             // {1, n_blocks, HT}
-    // Guard the ranking against non-finite pooled scores (fully-masked blocks pool to -inf; a
-    // garbage cell could pool to +inf): clamp AFTER the pool, where it is n_blocks values per
-    // (head, token) instead of n_kv, and through a one-row view so the in-place kernel covers all
-    // of them (see the index-key clamp above). Dead blocks keep ranking last at -BIG, live-block
-    // ranking is untouched (real scores are far inside +/-BIG), so selection is unchanged.
+    // Guard the ranking against a +inf that reached the pool from a live cell: clamp AFTER the
+    // pool, where it is n_blocks values per (head, token) instead of n_kv, and through a one-row
+    // view so the in-place kernel covers all of them (see the index-key clamp above).
+    // A fully-masked block pools to -FLT_MAX, not -inf (POOL_MAX's init value is never beaten by
+    // -inf, since `-inf > -FLT_MAX` is false); the clamp maps that to -BIG, which still ranks last.
+    // Live-block ranking is untouched (real scores are far inside +/-BIG), so selection is
+    // unchanged. NaN cannot reach here -- the pool drops it one node earlier -- which matters
+    // because ggml_clamp maps NaN to +max and would rank such a block FIRST.
     blk = ggml_clamp(ctx0, ggml_reshape_2d(ctx0, blk, n_blocks*HT, 1), -BIG, BIG);
     blk = ggml_reshape_3d(ctx0, blk, n_blocks, idx_heads, n_tokens);          // {n_blocks, idx_heads, n_tokens}
     // Diagnostic tag (cb is a no-op unless an eval-callback consumes it): the pooled per-block
