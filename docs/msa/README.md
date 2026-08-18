@@ -123,7 +123,8 @@ best (512) — see the caveat below, it matters.
 
 **Every number here is a single run, and the measured run-to-run spread on this machine is ±1.1%**
 (three interleaved runs of the same configuration, across two builds already shown to be
-output-identical, gave 51.22 / 50.72 / 50.10 t/s). A fourth run taken
+output-identical, gave 51.22 / 50.72 / 50.10 t/s — so a difference of two runs is consistent with
+zero out to about ±2.2%). A fourth run taken
 immediately after a change of regime came in 18% low, so first-run-after-a-change is discarded.
 Read the 64k ratios, which are 39% and 16%, as real; read anything within a couple of percent as no
 difference.
@@ -170,7 +171,7 @@ this branch has nothing to offer you.
 
 ![decode vs context](advantage-vs-context.png)
 
-At 16k the prefill difference is inside the ±1.1% noise floor (1.02x in one pair, 0.99x in
+At 16k the prefill difference is consistent with zero given that floor (1.02x in one pair, 0.99x in
 another), so the honest statement is that there is **none measurable**. Decode is **0.79x**, well
 outside it: at that depth the feature is a real net loss on decode. The gathered attention is
 nearly flat in `n_kv` while dense attention is not, so the advantage only appears with depth; the
@@ -197,8 +198,11 @@ dense for the metric you care about, the decode win is about 8%.
 
 ![compute buffer](compute-buffer.png)
 
-1,350 MiB at 64k, where the mask path's own measured law predicts 17,258 MiB — so replacing the mask
-with a cell list removes most of the growth, but **not all of it**.
+1,350 MiB at 64k. The **original wide-mask** implementation's measured law
+(`0.262268 x n_kv + 70 MiB`) predicts 17,258 MiB there — but that is not the arm this document
+benchmarks. The parent commit's per-GQA split already brought the shipped mask path to
+**1,601.57 MiB** at 64k, so the like-for-like saving from the cell list is **16%
+(1,602 -> 1,350), not 12.8x**. Most of the growth was removed by the split, not by this change.
 
 At a matched `-ub 512`, dense's compute buffer is flat: 402.75 MiB at both 16k and 64k. The
 gather's goes 402.75 -> 1,350.49 over the same span. So at equal context and equal ubatch the
