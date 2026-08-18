@@ -116,15 +116,21 @@ Every number in the table is a single run. **Decode and prefill have very differ
 difference matters more than the level.** Three interleaved repeats of each arm at n_kv 2,240,
 same binary, same session:
 
-| arm | prefill spread (sd) | decode spread (sd) |
-|---|---:|---:|
-| dense | **3.53%** | **0.24%** |
-| gather | 1.26% | 0.80% |
+| arm | n | prefill spread (sd) | decode spread (sd) |
+|---|---:|---:|---:|
+| dense | 4 | **3.11%** | **0.41%** |
+| gather | 5 | **4.01%** | **1.12%** |
 
-So a decode difference above ~3% is real, and a prefill difference below ~7% is not. An earlier
+So a decode difference above ~3% is real, and a prefill difference below ~8% is not. An earlier
 version of this section quoted a single ±1.1% figure taken from prefill runs and applied it to
 both; that was wrong in both directions. A run taken immediately after a change of regime came in
 18% low; first-run-after-a-change is discarded.
+
+Prefill scatters about **7.5x** more than decode here. That ratio is close to
+`sqrt(192 decode tokens / 4 prefill ubatches) = 6.9`, so it may be nothing more than the decode
+figure being an average over 48x more units — not a difference in kind between the two phases.
+Untested; it predicts that prefill scatter falls as `1/sqrt(npp/ubatch)`, which repeats at a larger
+`npp` would settle.
 
 | n_kv | dense decode | gather decode | dense prefill | gather prefill |
 |---:|---:|---:|---:|---:|
