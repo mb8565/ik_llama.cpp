@@ -490,6 +490,7 @@ extern "C" {
         int  msa_top_k;         // MSA top-k blocks override (<0 => model's configured topk_blocks) [EXPERIMENTAL]
         bool msa_gather;        // MSA: FA-kernel gather of the selected cells [EXPERIMENTAL]
         bool msa_split_gqa;     // MSA: one attention call per GQA group (on by default) [EXPERIMENTAL]
+        float msa_dense_frac;   // MSA: dense fallback when top-k keeps >= this fraction of blocks [EXPERIMENTAL]
         int  attn_max_batch;    // maximum batch size for attention computations [EXPERIMENTAL]
         bool fused_moe_up_gate; // whether to use fused MoE up/gate op
         bool grouped_expert_routing; // whether to use grouped expert routing (BailingMoeV2 arch)

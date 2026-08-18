@@ -70,7 +70,11 @@ ggml_tensor * llm_build_context::build_minimaxm3_msa_mask(ggml_cgraph * gf,
     // reads uninitialised (zero) cache cells for those positions and the block-max-pool/top-k drops genuinely
     // attended blocks (PPL collapse). So always compute + write the index keys first, then early-out. (index_q
     // below is only expanded into the graph on the sparse path, so the dense case still computes just index_k.)
-    const bool msa_dense = topk_blk >= n_blocks;
+    // --msa-dense-frac F widens the early-out: fall back to the dense mask whenever top-k would keep
+    // at least F of the blocks -- too little sparsity to pay the selection machinery for. F = 1.0
+    // (the default) is exactly the covers-every-block condition above; below 1.0 the fallback
+    // attends a SUPERSET of the reference selection, trading reference fidelity for dense attention.
+    const bool msa_dense = (double) topk_blk >= (double) cparams.msa_dense_frac * (double) n_blocks;
 
     // --- normed hidden (same X the main attention sees) ---
     ggml_tensor * x = llm_build_norm(ctx0, cur, hparams, layer.attn_norm, nullptr,

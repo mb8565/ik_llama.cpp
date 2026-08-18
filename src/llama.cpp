@@ -7996,6 +7996,7 @@ struct llama_context_params llama_context_default_params() {
         /*.msa_top_k                   =*/ -1,
         /*.msa_gather                  =*/ false,
         /*.msa_split_gqa               =*/ true,
+        /*.msa_dense_frac              =*/ 1.0f,
         /*.attn_max_batch              =*/ 256,
         /*.fused_moe_up_gate           =*/ true,
         /*.grouped_expert_routing      =*/ false,
@@ -8490,6 +8491,7 @@ struct llama_context * llama_init_from_model(
     cparams.msa_top_k        = params.msa_top_k;
     cparams.msa_split_gqa    = params.msa_split_gqa;
     cparams.msa_gather       = params.msa_gather;
+    cparams.msa_dense_frac   = params.msa_dense_frac;
     cparams.attn_max_batch   = params.attn_max_batch;
     cparams.fused_moe_up_gate= params.fused_moe_up_gate;
     cparams.grouped_expert_routing = params.grouped_expert_routing;
@@ -8678,6 +8680,9 @@ struct llama_context * llama_init_from_model(
             LLAMA_LOG_INFO("%s: msa_gather    = %d\n", __func__, cparams.msa_gather);
             if (cparams.msa_top_k >= 0) {
                 LLAMA_LOG_INFO("%s: msa_top_k     = %d\n", __func__, cparams.msa_top_k);
+            }
+            if (cparams.msa_dense_frac < 1.0f) {
+                LLAMA_LOG_INFO("%s: msa_dense_frac= %.3f\n", __func__, cparams.msa_dense_frac);
             }
         }
     }

@@ -425,6 +425,7 @@ struct gpt_params {
     bool msa               = false; // enable MiniMax-M3 sparse attention (off by default; opt-in via --msa)
     int  msa_top_k         = -1;    // MSA top-k blocks override (<0 => use the model's configured topk_blocks)
     bool msa_gather        = false; // MSA: let the FA kernel gather the selected cells (--msa-gather) [EXPERIMENTAL]
+    float msa_dense_frac   = 1.0f;  // MSA: dense fallback when top-k keeps >= this fraction of blocks (--msa-dense-frac)
     bool msa_split_gqa     = true;  // MSA: one attention call per GQA group (on by default; --no-msa-split-gqa restores the wide mask)
     int  attn_max_batch    = 256;   // Max batch size to use when computing attention (only applicable if flash_attn = false)
     bool fused_moe_up_gate = true;  // fused up*unary(gate) op for MoE models
