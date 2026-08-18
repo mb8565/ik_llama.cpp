@@ -45,6 +45,66 @@ inline void accumulate_qkv(int Dv, float& M, float& S, float Mj, float Sj, float
         for (int i = 0; i < Dv; ++i) Racc[i] += c*R[i];
     }
 }
+// After the gather the selected rows are contiguous, so the compacted buffer is just a small
+// K-cache with nek2 = 1 and neq2 heads sharing it. Split it the way the dense decode path splits
+// the real cache: each thread takes a range of rows for all heads, and the partial (M, S, R) are
+// combined with accumulate_qkv. Every thread must reach the barrier, so the impl failure is
+// carried past it rather than returned from where it happens.
+bool iqk_fa_gather_kv_split(int int_type_k, int int_type_v, int Dk, int Dv, int neq2, int nkv,
+        long nbq2, long nb1, size_t row_size_k, size_t row_size_v,
+        const float * q, const char * work_k, const char * work_v, const ggml_fp16_t * work_m,
+        const float * sinks, float scale, float softcap, float * qkv, char * result_buffer,
+        barrier_t barrier, void * barrier_data, int ith, int nth) {
+    int nstep_k  = nkv/32;
+    int nk_split = std::min(nstep_k, nth);
+    int nstep_per_thread = (nstep_k + nk_split - 1)/nk_split;
+    int ith_mid = nk_split;
+    int nstep_this_thread = nstep_per_thread;
+    if (nstep_per_thread*nk_split > nstep_k) {
+        ith_mid = nstep_k - nk_split*(nstep_per_thread - 1);
+        if (ith >= ith_mid) --nstep_this_thread;
+    }
+    auto size_thread = (Dv + 16)*neq2*sizeof(float);
+    bool ok = true;
+    if (ith < nk_split) {
+        int first_row = 32*(ith <= ith_mid ? ith*nstep_per_thread
+                                           : ith_mid*nstep_per_thread + (ith - ith_mid)*nstep_this_thread);
+        auto this_result = (float *)(result_buffer + ith*size_thread);
+        ok = iqk_flash_attn_impl(int_type_k, int_type_v,
+                Dk, Dv, neq2, 32*nstep_this_thread, nbq2, row_size_k, row_size_v, 0, Dv,
+                q, work_k + first_row*row_size_k, work_v + first_row*row_size_v, work_m + first_row,
+                nullptr, 0, scale, softcap,
+                this_result, this_result + (Dv+0)*neq2, this_result + (Dv+1)*neq2);
+    }
+
+    barrier(barrier_data);
+    if (!ok) return false;
+
+    for (int j = ith; j < neq2; j += nth) {
+        auto Racc = qkv + j*nb1/sizeof(float);
+        float M = -INFINITY, S = 0;
+        for (int jth = 0; jth < nk_split; ++jth) {
+            auto R  = (const float *)(result_buffer + jth*size_thread);
+            auto Mj = R + Dv*neq2;
+            auto Sj = Mj + neq2;
+            R += j*Dv;
+            accumulate_qkv(Dv, M, S, Mj[j], Sj[j], Racc, R);
+        }
+        if (sinks) {
+            float s = sinks[j];
+            if (s > M) {
+                float m = expf(M - s);
+                for (int i = 0; i < Dv; ++i) Racc[i] *= m;
+                S = S*m + 1;
+            } else {
+                S += expf(s - M);
+            }
+        }
+        float norm = S > 0 ? 1/S : 1;
+        for (int i = 0; i < Dv; ++i) Racc[i] *= norm;
+    }
+    return true;
+}
 }
 
 size_t iqk_fa_work_buffer_size(const struct ggml_tensor * dst, int nth) {
@@ -58,7 +118,12 @@ size_t iqk_fa_work_buffer_size(const struct ggml_tensor * dst, int nth) {
         auto row_size_v = ggml_row_size(V->type, V->ne[0]);
         auto work_size  = (row_size_k + row_size_v + 64) * indexer->ne[0];
         size_t result = work_size * nth;
-        if (Q->ne[1]== 1) result += 512*sizeof(float);
+        if (Q->ne[1]== 1) {
+            result += 512*sizeof(float);
+            // When there are fewer heads than threads the gathered rows are split over the threads
+            // too, and each thread needs a slot for its partial result plus its (M, S).
+            if (Q->ne[2] < nth) result += 64 + (V->ne[0] + 16)*Q->ne[2]*nth*sizeof(float);
+        }
         return result;
         //return work_size * nth;
     }
@@ -230,9 +295,24 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
                     }
                 }
                 barrier(barrier_data);
-                if (last_found < 0 || neq2_this_thread < 1) return true;
+                // last_found is computed from the same index list by all threads, so this return
+                // is taken by all of them or by none - no thread is left waiting at a barrier.
+                if (last_found < 0) return true;
                 ++last_found;
                 int this_nkv = 32*((last_found + 31)/32);
+                // neq2 is n_head/n_groups when the caller splits the GQA groups (16 heads for
+                // MiniMax-M3 MSA), so splitting the heads alone leaves nth - neq2 threads with
+                // nothing to do and has each of the rest read the entire compacted buffer.
+                if (int nstep_k = this_nkv/32; neq2 < nth && nstep_k > 1 && nstep_k >= neq2) {
+                    auto result_offset = (row_size_k + row_size_v)*nkv + sizeof(ggml_fp16_t)*nkv*nth;
+                    return iqk_fa_gather_kv_split(int_type_k_in, int_type_v, Dk, Dv, neq2, this_nkv,
+                            nbq2, nb1, row_size_k, row_size_v, (const float *)q,
+                            work_k, k == v ? work_k : work_v, work_m, (const float *)sinks,
+                            scale, softcap, qkv,
+                            (char *)work_buffer_in + ((result_offset + 63) & ~size_t(63)),
+                            barrier, barrier_data, ith, nth);
+                }
+                if (neq2_this_thread < 1) return true;
                 auto this_q = (const char *)q + first*nbq2;
                 auto this_qkv = qkv + first*nb1/sizeof(float);
                 if (!iqk_flash_attn_impl(int_type_k_in, int_type_v,
