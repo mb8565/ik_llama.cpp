@@ -197,11 +197,17 @@ dense for the metric you care about, the decode win is about 8%.
 
 ![compute buffer](compute-buffer.png)
 
-1,350 MiB at 64k, where the mask path's own measured law predicts 17,258 MiB. It still grows with
-`n_kv` — but so does dense, which is 403 MiB at 16k and 1,611 MiB at 64k, so at equal context the
-gather's buffer is **smaller than dense's**, not larger. (A 128k point of 2,635 MiB was taken
-earlier against the same law's 34,446 MiB, but not re-measured in this configuration, so the chart
-stops at 64k.)
+1,350 MiB at 64k, where the mask path's own measured law predicts 17,258 MiB — so replacing the mask
+with a cell list removes most of the growth, but **not all of it**.
+
+At a matched `-ub 512`, dense's compute buffer is flat: 402.75 MiB at both 16k and 64k. The
+gather's goes 402.75 -> 1,350.49 over the same span. So at equal context and equal ubatch the
+gather's buffer is **3.4x dense's at 64k**, and something in this path still scales with `n_kv`
+that has not been identified. (Quoting dense at `-ub 2048`, where its buffer is 1,611 MiB, would
+make the gather look smaller; that is a different ubatch and not a fair comparison.)
+
+A 128k point of 2,635 MiB was taken earlier against the same law's 34,446 MiB, but not re-measured
+in this configuration, so the chart stops at 64k.
 
 ---
 
