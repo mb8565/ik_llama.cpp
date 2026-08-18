@@ -162,19 +162,29 @@ Quoting only the first row would understate prefill and overstate decode. Tuned 
 care about, the decode win is about 8%. (`-ub 2048` moves the gather to 27.44 / 2.16 for a
 5,359 MiB buffer — +1.3% prefill for 4x the memory, so 512 is the operating point.)
 
-**Against the path it replaces.** The mask path at 64k is 11.49 prefill / 1.59 decode — *slower
-than dense at prefill*, because selecting blocks and then materialising a mask costs more than the
-sparsity saves. At matched `-ub 512` the cell list is **2.36x its prefill and 1.34x its decode**.
-That comparison, not the one with dense, is what this change is for.
+**Against the path it replaces.** Both MSA arms re-measured together on one binary
+(`4856 b2fa29c0`), matched `-ub 512` and `-ntg 192`, GPUs hidden, gate PASS on both:
+
+| 64k, `-ub 512`, `-ntg 192` | prefill t/s | decode t/s | compute buffer | graph nodes |
+|---|---:|---:|---:|---:|
+| `--msa` (mask path) | 11.21 | 1.58 | 1,625.13 MiB | 6,883 |
+| `--msa --msa-gather` (cell list) | **26.21** | **2.28** | **1,333.26 MiB** | 6,429 |
+| ratio | **2.34x** | **1.44x** | **0.82x** | 0.93x |
+
+The mask path is *slower than dense at prefill*, because selecting blocks and then materialising a
+mask costs more than the sparsity saves. That comparison, not the one with dense, is what this
+change is for. (An earlier version of this paragraph quoted 2.36x / 1.34x from two runs on
+different builds at `-ntg 64`; these replace them.)
 
 ### Compute buffer
 
 ![compute buffer](compute-buffer.png)
 
-1,350 MiB at 64k. The **original wide-mask** law (`0.262268 x n_kv + 70 MiB`) predicts 17,258 MiB
+1,333 MiB at 64k. The **original wide-mask** law (`0.262268 x n_kv + 70 MiB`) predicts 17,258 MiB
 there, but that is not the arm this document benchmarks: the parent commit's per-GQA split had
-already brought the shipped mask path to **1,601.57 MiB**. The like-for-like saving is therefore
-**16% (1,602 -> 1,350), not 12.8x** — most of the growth was removed by the split, not by this
+already brought the shipped mask path to **1,625.13 MiB** (re-measured with the gather arm on one
+binary; an earlier run of that arm gave 1,601.57). The like-for-like saving is therefore
+**18% (1,625 -> 1,333), not 12.8x** — most of the growth was removed by the split, not by this
 change.
 
 At matched `-ub 512` dense's buffer is flat, 402.75 MiB at both 16k and 64k, while the gather's
