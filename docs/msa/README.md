@@ -199,6 +199,12 @@ evaluation a single-token decode graph:
 sparse mask for values exactly zero scored **0.037960 ± 0.002456** — nine sigma worse, and invisible
 to both greedy text and ordinary batched perplexity.
 
+**Read "vs a dense reference" as a divergence, not a quality loss.** Dense is the reference here
+only because it is what this fork runs by default; MSA is the architecture's own mechanism, so
+attending every cell is the path the model was not built for. The figure says how far the two
+implementations sit apart. It does not say which is closer to the model's intended output, and
+nothing here measures that.
+
 ---
 
 ## What this does not do
