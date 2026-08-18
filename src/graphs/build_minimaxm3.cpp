@@ -116,7 +116,12 @@ ggml_tensor * llm_build_context::build_minimaxm3_msa_mask(ggml_cgraph * gf,
         ggml_tensor * kr = kv_self.kr_l[il];                                  // {d_idx, kv_size} F16
         ggml_tensor * dst = ggml_view_2d(ctx0, kr, d_idx, n_tokens,
                 kr->nb[1], (size_t) kv_head * kr->nb[1]);
-        ggml_tensor * ik_safe = ggml_clamp(ctx0, ik, -6.0e4f, 6.0e4f);        // kill F16 inf/nan at the source
+        // ggml_clamp is in-place and its CPU kernel visits rows ith, ith+nth, ... with ith==0 only,
+        // so on a multi-row tensor it clamps 1 row in nth and passes the rest through unclamped.
+        // Present the batch as a single row so the write is actually covered.
+        ggml_tensor * ik_safe = ggml_clamp(ctx0, ggml_reshape_2d(ctx0, ik, d_idx*n_tokens, 1),
+                -6.0e4f, 6.0e4f);                                             // kill F16 inf/nan at the source
+        ik_safe = ggml_reshape_2d(ctx0, ik_safe, d_idx, n_tokens);
         ggml_tensor * kr_cpy = ggml_cpy(ctx0, ik_safe, dst);
         // GRAPH-REUSE FIXUP REGISTRATION: the K/V cache_copies fixup re-points the K/V write
         // offsets to the current kv_head when a graph is reused, but it does NOT touch
@@ -166,23 +171,26 @@ ggml_tensor * llm_build_context::build_minimaxm3_msa_mask(ggml_cgraph * gf,
         floor3 = ggml_reshape_3d(ctx0, floor3, n_kv_eff, 1, n_tokens); // {n_kv,1,n_tok} F32
         if (shared) shared->floor3 = floor3;
     }
-    // Defense-in-depth for the indexer-key clamp above: clamp the raw indexer scores to a finite range
-    // BEFORE adding the causal floor. With finite scores, score + (-inf causal) = -inf (clean), so
-    // a stale/padding cell can never reach the block-max-pool as NaN. (The key clamp above already
-    // removes the inf SOURCE; this guards any residual non-finite, e.g. a pre-fix NaN still resident
-    // in kr_l.) BIG=1e30 is far above any real indexer score, so valid-cell ranking is unaffected.
-    scores = ggml_clamp(ctx0, scores, -BIG, BIG);
-    scores = ggml_add(ctx0, scores, floor3);                                  // broadcast over idx_heads
-
     // --- BlockMaxPool over kv per idx-head: {n_kv, idx_heads, n_tokens} -> {n_blocks, idx_heads, n_tokens} ---
-    // Fold (idx_head, token) into one axis so a single pool_1d covers them all. Pad n_kv up to
-    // n_blocks*B_k with -BIG (so an all-negative block can't be beaten by zero-pad), reshape to
-    // {B_k, n_blocks * idx_heads*n_tokens}, max-reduce over B_k.
+    // Fold (idx_head, token) into one axis so a single pool_1d covers them all.
     const int64_t HT = idx_heads * n_tokens;                                  // folded (head,token) count
     const int64_t n_pad = n_blocks * B_k - n_kv_eff;
-    // scores -> {n_kv, idx_heads*n_tokens}
-    ggml_tensor * sc2 = ggml_reshape_2d(ctx0, ggml_cont(ctx0, scores), n_kv_eff, HT);
-    if (n_pad > 0) {
+    ggml_tensor * blk;
+    if (n_pad == 0) {
+        // n_kv is block-aligned (always true under FA: the cache view pads to 256). Fold the block
+        // axis out of ne0 BEFORE the causal-floor add: {B_k, n_blocks*idx_heads, n_tokens} against a
+        // {B_k, n_blocks, n_tokens} floor is the same per-cell add (row h*n_blocks+b takes floor
+        // block b via the % ne11 broadcast), but it hands the add n_blocks*idx_heads rows instead of
+        // idx_heads -- at decode that is 4 working threads vs all of them. The sum is already laid
+        // out as the {B_k, n_blocks, HT} pool input, so the ggml_cont the flat shape needed goes too.
+        ggml_tensor * sc3 = ggml_reshape_3d(ctx0, scores, B_k, n_blocks*idx_heads, n_tokens);
+        ggml_tensor * fl3 = ggml_reshape_3d(ctx0, floor3, B_k, n_blocks, n_tokens);
+        blk = ggml_reshape_3d(ctx0, ggml_add(ctx0, sc3, fl3), B_k, n_blocks, HT);
+    } else {
+        // soft_max path only: pad n_kv up to n_blocks*B_k with -BIG (so an all-negative block can't
+        // be beaten by zero-pad), reshape to {B_k, n_blocks * idx_heads*n_tokens}.
+        scores = ggml_add(ctx0, scores, floor3);                              // broadcast over idx_heads
+        ggml_tensor * sc2 = ggml_reshape_2d(ctx0, ggml_cont(ctx0, scores), n_kv_eff, HT);
         sc2 = ggml_pad(ctx0, sc2, n_pad, 0, 0, 0);                            // {n_blocks*B_k, HT}
         ggml_tensor * pos = ggml_arange(ctx0, 0.0f, (float) (n_blocks * B_k), 1.0f);
         ggml_tensor * tail = ggml_scale(ctx0,
@@ -190,9 +198,15 @@ ggml_tensor * llm_build_context::build_minimaxm3_msa_mask(ggml_cgraph * gf,
                 -BIG);                                                        // {n_blocks*B_k}
         tail = ggml_reshape_2d(ctx0, tail, n_blocks * B_k, 1);
         sc2 = ggml_add(ctx0, sc2, tail);                                      // broadcast over HT
+        blk = ggml_reshape_3d(ctx0, sc2, B_k, n_blocks, HT);
     }
-    ggml_tensor * blk = ggml_reshape_3d(ctx0, sc2, B_k, n_blocks, HT);
     blk = ggml_pool_1d(ctx0, blk, GGML_OP_POOL_MAX, B_k, B_k, 0);             // {1, n_blocks, HT}
+    // Guard the ranking against non-finite pooled scores (fully-masked blocks pool to -inf; a
+    // garbage cell could pool to +inf): clamp AFTER the pool, where it is n_blocks values per
+    // (head, token) instead of n_kv, and through a one-row view so the in-place kernel covers all
+    // of them (see the index-key clamp above). Dead blocks keep ranking last at -BIG, live-block
+    // ranking is untouched (real scores are far inside +/-BIG), so selection is unchanged.
+    blk = ggml_clamp(ctx0, ggml_reshape_2d(ctx0, blk, n_blocks*HT, 1), -BIG, BIG);
     blk = ggml_reshape_3d(ctx0, blk, n_blocks, idx_heads, n_tokens);          // {n_blocks, idx_heads, n_tokens}
     // Diagnostic tag (cb is a no-op unless an eval-callback consumes it): the pooled per-block
     // indexer scores, shaped {n_blocks, idx_heads, n_tokens}, BEFORE local-include / top-k.
@@ -279,9 +293,10 @@ ggml_tensor * llm_build_context::build_minimaxm3_msa_mask(ggml_cgraph * gf,
             if (shared) shared->cell_table = table;
         }
         table = ggml_reshape_2d(ctx0, table, B_k, n_blocks);                        // {B_k, n_blocks}
-        // Selected block ids, contiguous: {topk_blk, HT} -> flat.
-        ggml_tensor * sel_blk = ggml_cont(ctx0,
-                ggml_view_2d(ctx0, sorted, topk_blk, HT, sorted->nb[1], 0));        // {topk_blk, HT} I32
+        // Selected block ids, contiguous: {topk_blk, HT} -> flat. ggml_top_k sets the argsort's
+        // count so the CPU kernel std::partial_sorts topk_blk of n_blocks instead of full-sorting;
+        // the full-sort `sorted` above is not an ancestor of `cells`, so it drops out of the graph.
+        ggml_tensor * sel_blk = ggml_cont(ctx0, ggml_top_k(ctx0, blk2, (int) topk_blk)); // {topk_blk, HT} I32
         ggml_tensor * flat = ggml_reshape_1d(ctx0, sel_blk, topk_blk*HT);
         ggml_tensor * cells = ggml_get_rows_ext(ctx0, table, flat, true, false);    // {B_k, topk_blk*HT} I32
         cells = ggml_reshape_2d(ctx0, ggml_cont(ctx0, cells), n_gather, HT);        // {n_gather, HT}
