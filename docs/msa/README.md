@@ -112,10 +112,19 @@ MiniMax-M3 Q4_K_M, CPU-only, dual Xeon Platinum 8260, `-t 48`, GPUs hidden with
 **All rows `-ub 512` for both arms.** Rows up to 16,576 use `-ntg 192`; the 65,600 row uses
 `-ntg 64`, which does not affect prefill and changes the decode average by well under a percent.
 
-Every number is a single run. Measured spread is ±1.1% (three interleaved runs of one configuration
-across two builds already shown to be output-identical gave 51.22 / 50.72 / 50.10 t/s), so a
-difference of two runs is consistent with zero out to about ±2.2%. A fourth run taken immediately after a change of regime came in 18% low; first-run-after-a-
-change is discarded.
+Every number in the table is a single run. **Decode and prefill have very different noise, and the
+difference matters more than the level.** Three interleaved repeats of each arm at n_kv 2,240,
+same binary, same session:
+
+| arm | prefill spread (sd) | decode spread (sd) |
+|---|---:|---:|
+| dense | **3.53%** | **0.24%** |
+| gather | 1.26% | 0.80% |
+
+So a decode difference above ~3% is real, and a prefill difference below ~7% is not. An earlier
+version of this section quoted a single ±1.1% figure taken from prefill runs and applied it to
+both; that was wrong in both directions. A run taken immediately after a change of regime came in
+18% low; first-run-after-a-change is discarded.
 
 | n_kv | dense decode | gather decode | dense prefill | gather prefill |
 |---:|---:|---:|---:|---:|
@@ -146,9 +155,19 @@ The penalty is about 120 ms at the short end and is **not** fixed; describing it
 overstates the gather at low context and understates it at high. The crossover is where that
 column changes sign, which is somewhere between 16k and 64k.
 
-**Below that it is a net loss.** Prefill is ~7% slower at 4k-8k and within noise at 2k (+1.2%) and
-16k (+2.3%); decode is **0.79x** at 16k, well outside the noise floor. If your contexts live between 4k and 16k this
-branch has nothing to offer you.
+**Below that it is a net loss on decode, and the prefill differences below 64k are not
+measurable.** Decode is **0.79x** at 16k, far outside the noise floor. Prefill is a different
+story: three interleaved repeats of each arm at n_kv 2,240 give a dense prefill spread of
+**3.53%** and a gather spread of 1.26%, so the standard deviation of a prefill *ratio* is about
+3.7%. The table's prefill differences at 2k (+1.2%), 4k (-6.6%), 8k (-6.9%) and 16k (+2.3%) are
+all inside about two of those, from one run per cell. **Only the 64k prefill result is outside the
+scatter.** Do not read the 4k-8k prefill numbers as a finding.
+
+(That scatter was measured where a prefill run lasts 27 s; at 16k it lasts 330 s and averages over
+far more work, so it should scatter less. The figure above is an upper bound on the noise at
+4k-16k, and the fix is repeats at those sizes, not an assumption either way.)
+
+If your contexts live between 4k and 16k this branch has nothing to offer you on decode.
 
 **Ubatch, and how the choice can flatter either arm.** Dense's own best prefill is `-ub 2048`
 (19.42 at 64k, +20.8%), but that setting costs it decode (1.84 against 1.98 at `-ub 512`). So:
