@@ -273,12 +273,17 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
                 auto work_k = (char *)work_buffer_in;
                 auto work_v = work_k + row_size_k*indexer->ne[0];
                 auto work_m = (ggml_fp16_t *)(work_v + row_size_v*indexer->ne[0]) + indexer->ne[0]*ith;
+                // The rows come from all over the cache either way, but a contiguous destination
+                // range keeps each thread writing one run of the compacted buffer.
+                int nkv_per_thread = (nkv + nth - 1)/nth;
+                int first_kv = ith*nkv_per_thread;
+                int last_kv  = std::min(first_kv + nkv_per_thread, nkv);
                 int last_found = -1;
                 for (int j = 0; j < nkv; ++j) {
                     if (idx[j] >= 0) {
                         last_found = j;
                         work_m[j] = M[idx[j]];
-                        if (j % nth == ith) {
+                        if (j >= first_kv && j < last_kv) {
                             std::memcpy(work_k + row_size_k*j, ((const char *)k + idx[j]*stride_k), row_size_k);
                             if (k != v) {
                                 std::memcpy(work_v + row_size_v*j, ((const char *)v + idx[j]*stride_v), row_size_v);
@@ -286,7 +291,7 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
                         }
                     } else {
                         work_m[j] = h_inf;
-                        if (j % nth == ith) {
+                        if (j >= first_kv && j < last_kv) {
                             std::memset(work_k + row_size_k*j, 0, row_size_k);
                             if (k != v) {
                                 std::memset(work_v + row_size_v*j, 0, row_size_v);
