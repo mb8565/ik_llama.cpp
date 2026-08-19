@@ -1961,9 +1961,9 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.msa_gather = true;
         return true;
     }
-    if (arg == "-msadf" || arg == "--msa-dense-frac") {
+    if (arg == "-msamk" || arg == "--msa-min-kv") {
         CHECK_ARG
-        params.msa_dense_frac = std::max(0.0f, std::min(1.0f, std::stof(argv[i])));
+        params.msa_min_kv = std::max(0, std::stoi(argv[i]));
         return true;
     }
     if (arg == "-no-msasg" || arg == "--no-msa-split-gqa") {
@@ -3104,7 +3104,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-msa,  --msa",                  "enable MiniMax-M3 sparse attention (MINIMAX-M3 arch only; default: %s)", params.msa ? "enabled" : "disabled" });
     options.push_back({ "*",           "-msatk, --msa-top-k",           "MSA top-k blocks override; <0 uses the model's configured topk_blocks (default: %d)", params.msa_top_k });
     options.push_back({ "*",           "-msag, --msa-gather",           "MSA: attend only the selected cells (FA-kernel gather; default: %s)", params.msa_gather ? "enabled" : "disabled" });
-    options.push_back({ "*",           "-msadf, --msa-dense-frac",      "MSA: fall back to the dense mask when top-k would keep at least this fraction of the blocks (default: %.2f)", (double) params.msa_dense_frac });
+    options.push_back({ "*",           "-msamk, --msa-min-kv N",        "MSA: run dense attention while the KV cache is smaller than N, sparse at or above it. 0 disables the fallback. Machine-specific: the crossover measured on a dual Xeon 8260 is ~23000, and there is no portable default (default: %d)", params.msa_min_kv });
     options.push_back({ "*",           "-no-msasg, --no-msa-split-gqa", "MSA: attend all heads in one call under an n_head-wide mask (default: %s)", params.msa_split_gqa ? "disabled" : "enabled" });
     options.push_back({ "*",           "-amb,  --attention-max-batch",  "max batch size for attention computations (default: %d)", params.attn_max_batch});
     options.push_back({ "*",           "-no-fmoe, --no-fused-moe",      "disable fused MoE (default: %s)", params.fused_moe_up_gate ? "enabled" : "disabled" });
@@ -4385,7 +4385,7 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.msa_top_k         = params.msa_top_k;
     cparams.msa_split_gqa     = params.msa_split_gqa;
     cparams.msa_gather        = params.msa_gather;
-    cparams.msa_dense_frac    = params.msa_dense_frac;
+    cparams.msa_min_kv        = params.msa_min_kv;
     cparams.attn_max_batch    = params.attn_max_batch;
     cparams.fused_moe_up_gate = params.fused_moe_up_gate;
     cparams.grouped_expert_routing = params.grouped_expert_routing;

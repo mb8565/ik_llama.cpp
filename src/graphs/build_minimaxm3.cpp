@@ -70,11 +70,26 @@ ggml_tensor * llm_build_context::build_minimaxm3_msa_mask(ggml_cgraph * gf,
     // reads uninitialised (zero) cache cells for those positions and the block-max-pool/top-k drops genuinely
     // attended blocks (PPL collapse). So always compute + write the index keys first, then early-out. (index_q
     // below is only expanded into the graph on the sparse path, so the dense case still computes just index_k.)
-    // --msa-dense-frac F widens the early-out: fall back to the dense mask whenever top-k would keep
-    // at least F of the blocks -- too little sparsity to pay the selection machinery for. F = 1.0
-    // (the default) is exactly the covers-every-block condition above; below 1.0 the fallback
-    // attends a SUPERSET of the reference selection, trading reference fidelity for dense attention.
-    const bool msa_dense = (double) topk_blk >= (double) cparams.msa_dense_frac * (double) n_blocks;
+    // Two separate reasons to take the dense path, deliberately NOT folded into one comparison.
+    //
+    // (a) The no-op-exact condition above: the budget covers every block, so MSA == dense and the
+    //     selection would be pure cost. Always on, not a user choice.
+    //
+    // (b) --msa-min-kv N: below n_kv = N the sparse path is a measured net LOSS on this hardware,
+    //     so run dense and skip the selection. This attends a SUPERSET of the reference selection,
+    //     trading reference fidelity for speed, which is why it is off by default (N = 0).
+    //     N is an absolute KV count because that is the quantity the crossover is a function of.
+    //     It replaces --msa-dense-frac, which took a fraction of the block budget: with topk_blk
+    //     fixed, that was the same threshold expressed in units nobody could reason about (a ~23k
+    //     switch needed -msadf 0.0889). There is NO portable default -- the crossover depends on
+    //     the machine's memory bandwidth and core count, and on this box it is ~23k.
+    //
+    // Note (b) cannot recover the whole sparse penalty and is not meant to: the index-key cache
+    // write above runs unconditionally, because skipping it rots the cache (see the comment on the
+    // early-out). Measured on a dual Xeon 8260 at n_kv 2,240, the fallback costs ~12% against pure
+    // dense -- that residue IS the key write.
+    const bool msa_dense = (topk_blk >= n_blocks)
+                        || (cparams.msa_min_kv > 0 && n_kv_eff < (int64_t) cparams.msa_min_kv);
 
     // --- normed hidden (same X the main attention sees) ---
     ggml_tensor * x = llm_build_norm(ctx0, cur, hparams, layer.attn_norm, nullptr,

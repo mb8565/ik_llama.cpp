@@ -7996,7 +7996,7 @@ struct llama_context_params llama_context_default_params() {
         /*.msa_top_k                   =*/ -1,
         /*.msa_gather                  =*/ false,
         /*.msa_split_gqa               =*/ true,
-        /*.msa_dense_frac              =*/ 1.0f,
+        /*.msa_min_kv                  =*/ 0,
         /*.attn_max_batch              =*/ 256,
         /*.fused_moe_up_gate           =*/ true,
         /*.grouped_expert_routing      =*/ false,
@@ -8493,7 +8493,7 @@ struct llama_context * llama_init_from_model(
     cparams.msa_gather       = params.msa_gather;
     // The CLI clamps this, but the C API does not go through it: a negative value would make
     // topk_blk >= frac*n_blocks always true and silently disable MSA with no warning.
-    cparams.msa_dense_frac   = std::max(0.0f, std::min(1.0f, params.msa_dense_frac));
+    cparams.msa_min_kv       = std::max(0, params.msa_min_kv);
     cparams.attn_max_batch   = params.attn_max_batch;
     cparams.fused_moe_up_gate= params.fused_moe_up_gate;
     cparams.grouped_expert_routing = params.grouped_expert_routing;
@@ -8683,8 +8683,8 @@ struct llama_context * llama_init_from_model(
             if (cparams.msa_top_k >= 0) {
                 LLAMA_LOG_INFO("%s: msa_top_k     = %d\n", __func__, cparams.msa_top_k);
             }
-            if (cparams.msa_dense_frac < 1.0f) {
-                LLAMA_LOG_INFO("%s: msa_dense_frac= %.3f\n", __func__, cparams.msa_dense_frac);
+            if (cparams.msa_min_kv > 0) {
+                LLAMA_LOG_INFO("%s: msa_min_kv    = %d\n", __func__, cparams.msa_min_kv);
             }
         }
     }

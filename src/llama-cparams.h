@@ -36,7 +36,7 @@ struct llama_cparams {
     int  msa_top_k = -1;   // MSA top-k blocks override (<0 => use the model's configured topk_blocks)
     bool msa_gather = false;    // MSA: FA-kernel gather of the selected cells (--msa-gather)
     bool msa_split_gqa = true;  // MSA: one attention call per GQA group (on by default; --no-msa-split-gqa)
-    float msa_dense_frac = 1.0f; // MSA: dense fallback when top-k keeps >= this fraction of blocks (--msa-dense-frac)
+    int  msa_min_kv = 0;        // MSA: run dense below this n_kv, sparse at or above it; 0 = off (--msa-min-kv)
     int  attn_max_batch;
     bool fused_moe_up_gate;
     bool grouped_expert_routing;
