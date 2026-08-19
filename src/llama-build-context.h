@@ -465,9 +465,11 @@ struct llm_build_context {
     // indexer tensors absent / cache missing). `cur` is the layer input (pre attn_norm).
     // `shared` caches the layer-independent subgraphs across the layer loop; pass the address of a
     // default-constructed msa_shared and they are built once per graph, not once per sparse layer.
+    // out_normed, when non-null, receives the RMSNorm(cur, attn_norm) this function computes for
+    // the indexer, so the caller can hand it to build_std_attention instead of recomputing it.
     ggml_tensor * build_minimaxm3_msa_mask(ggml_cgraph * gf, ggml_tensor * cur,
             ggml_tensor * inp_pos, ggml_tensor * KQ_mask, int il, msa_attn_split * msa,
-            msa_shared * shared = nullptr);
+            msa_shared * shared = nullptr, ggml_tensor ** out_normed = nullptr);
     // MiniMax-M3 MSA: partial NEOX RoPE on the indexer q/k ({d_idx, n_idx_heads, n_tokens}).
     ggml_tensor * build_minimaxm3_index_rope(ggml_tensor * v, ggml_tensor * inp_pos,
             int64_t n_rot_idx, int64_t d_idx, int64_t n_idx_heads, float idx_freq_base,
@@ -652,7 +654,12 @@ llm_expert_gating_func_type   gating_op,
             ggml_tensor * KQ_mask, ggml_tensor * sinks, ggml_tensor * inp_attn_scale, float KQ_scale, float f_attn_scale,
             int n_swa, int il, bool do_rope = true, bool add_graph_split = false, bool add_input = false, bool is_norm = false,
             bool is_multi = false, ggml_tensor * post_norm = nullptr, int kv_il = -1, float post_norm_eps = 0.0f,
-            post_norm_data * pnd = nullptr, const msa_attn_split * msa = nullptr);
+            post_norm_data * pnd = nullptr, const msa_attn_split * msa = nullptr,
+            // Already-normed `cur`. When non-null the internal attn_norm is SKIPPED and this is
+            // used in its place. `cur` itself is still what the add_input residual adds, so the
+            // two must be passed separately -- feeding the normed tensor in as `cur` would make
+            // the residual attn_out + RMSNorm(x) instead of attn_out + x.
+            ggml_tensor * pre_normed = nullptr);
 
     static ggml_tensor * build_output(llama_context & lctx, ggml_context * ctx, ggml_tensor * cur, ggml_tensor * output, const llm_build_cb & cb);
 

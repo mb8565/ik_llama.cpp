@@ -20,7 +20,7 @@
 // =============================================================================
 ggml_tensor * llm_build_context::build_minimaxm3_msa_mask(ggml_cgraph * gf,
         ggml_tensor * cur, ggml_tensor * inp_pos, ggml_tensor * KQ_mask, int il, msa_attn_split * msa,
-        msa_shared * shared) {
+        msa_shared * shared, ggml_tensor ** out_normed) {
 
     // MSA is off by default; opt in via the --msa CLI flag (cparams.msa). When disabled the
     // minimax-m3 model runs the dense MLA path, byte-identical to not having the feature.
@@ -94,6 +94,7 @@ ggml_tensor * llm_build_context::build_minimaxm3_msa_mask(ggml_cgraph * gf,
     // --- normed hidden (same X the main attention sees) ---
     ggml_tensor * x = llm_build_norm(ctx0, cur, hparams, layer.attn_norm, nullptr,
             LLM_NORM_RMS, cb, il);
+    if (out_normed) *out_normed = x;   // let the caller skip its identical attn_norm
 
     // RoPE params for the indexer (must match the reference: NEOX, n_rot=64, theta=5e6).
     // The reference applies the SAME partial RoPE the main attention uses
@@ -480,13 +481,20 @@ ggml_cgraph* llm_build_context::build_minimaxm3() {
     for (int il = 0; il < n_layer; ++il) {
         // MiniMax-M3 MSA: build the block-sparse mask for this layer (nullptr => dense).
         msa_attn_split msa;
+        // The indexer norms inpL with attn_norm; on a sparse layer the attention would then build
+        // a bit-identical second RMSNorm node (57 of them per token, ~0.9 ms). Take the indexer's
+        // and pass it as pre_normed. inpL is still handed over as the input, because that is what
+        // the add_input residual adds -- passing x_normed there instead would silently change the
+        // residual to attn_out + RMSNorm(inpL). On a dense layer x_normed stays null and nothing
+        // about this call changes.
+        ggml_tensor * x_normed = nullptr;
         ggml_tensor * msa_mask  = build_minimaxm3_msa_mask(gf, inpL, inp_pos, KQ_mask, il, &msa,
-                                                           &msa_sh);
+                                                           &msa_sh, &x_normed);
         ggml_tensor * attn_mask = msa_mask ? msa_mask : KQ_mask;
         ggml_tensor * ffn_inp = build_std_attention(gf, model.layers[il].attn_norm, inpL,
                 inp_pos, il == n_layer - 1 ? inp_out_ids : nullptr, nullptr,
                 attn_mask, nullptr, nullptr, 1.0f / sqrtf(float(n_embd_head)), 0.0f, 0,
-                il, true, false, true, false, false, nullptr, -1, 0.0f, nullptr, &msa);
+                il, true, false, true, false, false, nullptr, -1, 0.0f, nullptr, &msa, x_normed);
 
         if ((uint32_t) il < hparams.n_layer_dense_lead) {
             cur = llm_build_ffn(ctx0, lctx, model.layers[il].ffn_norm, ffn_inp,

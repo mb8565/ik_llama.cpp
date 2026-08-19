@@ -3194,7 +3194,7 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
         ggml_tensor * KQ_mask, ggml_tensor * sinks, ggml_tensor * inp_attn_scale, float KQ_scale, float f_attn_scale,
         int n_swa, int il, bool do_rope, bool add_graph_split, bool add_input, bool is_norm, bool is_multi,
         ggml_tensor * post_norm, int kv_il, float post_norm_eps, post_norm_data * pnd,
-        const msa_attn_split * msa) {
+        const msa_attn_split * msa, ggml_tensor * pre_normed) {
 
     float freq_base_l  = n_swa > 0 ? hparams.rope_freq_base_train_swa : cparams.rope_freq_base;
     float freq_scale_l = n_swa > 0 ? hparams.rope_freq_scale_train_swa : hparams.rope_freq_scale_train;
@@ -3529,7 +3529,14 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
     }
 
     auto cur = input;
-    if (the_attn_norm) {
+    if (pre_normed) {
+        // The caller already computed RMSNorm(input, the_attn_norm) -- MiniMax-M3's indexer does,
+        // for every sparse layer -- so reuse it instead of building an identical second node.
+        // `input` deliberately stays as it was: it is the add_input residual at the end of this
+        // function, and feeding the normed tensor in as `input` would make that residual
+        // attn_out + RMSNorm(x) instead of attn_out + x.
+        cur = pre_normed;
+    } else if (the_attn_norm) {
         cur = llm_build_norm(ctx0, cur, hparams, the_attn_norm, NULL, is_norm ? LLM_NORM : LLM_NORM_RMS, cb, il);
         cb(cur, "attn_norm", il);
     }
