@@ -29,23 +29,21 @@ ggml_tensor * llm_build_context::build_minimaxm3_msa_mask(ggml_cgraph * gf,
     if (model.arch != LLM_ARCH_MINIMAX_M3)            return nullptr;
     if (!hparams.minimax_sparse_layer(il))            return nullptr;
     const auto & layer = model.layers[il];
-    if (!layer.index_q || !layer.index_k)             return nullptr;          // GGUF dropped indexer
+    if (!layer.index_q || !layer.index_k) {
+        // Warn once: --msa is accepted and logged as enabled, so without this a conversion that
+        // dropped the indexer looks like MSA running at dense speed with no explanation.
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            LLAMA_LOG_WARN("%s: --msa requested but this GGUF has no indexer tensors; running dense. "
+                           "Re-convert with a converter that writes the indexer.\n", __func__);
+        }
+        return nullptr;
+    }
     if (kv_self.kr_l.size() <= (size_t) il || !kv_self.kr_l[il]) return nullptr; // no decode cache
-    // The faithful per-GQA-group selection emits a per-head mask (ne[2]=n_head). The CPU AND CUDA
-    // soft_max kernels honour the per-head plane (mask indexed by head = i02 % ne[2]) and are
-    // VALIDATED (msa-active soft_max PPL == dense within noise; selection-set diff vs HF ref = 0).
-    //
-    // The flash-attn per-head path is WIRED at the kernel level (CUDA tile/vec/wmma + CPU reference
-    // FA loop all index head = iq2 % ne[2]; ggml_flash_attn_ext assert relaxed; F16 mask cast below)
-    // and is now VALIDATED equal to the soft_max sparse path (FA -ub128 PPL 9.55 vs soft_max 9.40 at
-    // ctx 2560, 4 chunks; residual is ordinary F16-FA precision on a 2-bit base, not selection error).
-    // An earlier version of this path saw a large PPL inflation under flash-attn -ub128 that looked
-    // like a kr_l read-stride bug but was actually a GRAPH-REUSE fixup omission: update_cache_copies()
-    // re-points the K/V cache writes to the current kv_head on a reused graph but never touched the
-    // kr_l indexer write, so under FA (cache pads to 256 -> consecutive ubatches keep the same n_kv ->
-    // the graph IS reused) the indexer keys kept landing at the first ubatch's slot and recent
-    // index-key cells read 0.0. The fix registers the kr_l cpy in msa_cache_copies and patches its
-    // view_offs each reuse (see below). The gate is therefore REMOVED — MSA runs on FA by default.
+    // The per-GQA-group selection emits a per-head mask (ne[2]=n_head). The CPU and CUDA soft_max
+    // kernels and the flash-attn path all index the mask by head (i02 % ne[2]); both are validated
+    // against dense within noise, with a selection-set diff of 0 vs the HF reference.
     const int64_t d_idx     = hparams.minimax_sparse_index_dim;
     const int64_t idx_heads = hparams.minimax_sparse_index_heads > 0
                                   ? (int64_t) hparams.minimax_sparse_index_heads
@@ -63,31 +61,17 @@ ggml_tensor * llm_build_context::build_minimaxm3_msa_mask(ggml_cgraph * gf,
     const int64_t n_kv_eff = KQ_mask->ne[0];      // == n_kv
     const int64_t n_blocks = (n_kv_eff + B_k - 1) / B_k;
 
-    // No-op-exact fast path: when the budget covers every block, MSA == dense, so we return the dense mask
-    // (nullptr) and skip the lossy argsort selection. CRITICAL: this early-out must run AFTER the index-key
-    // cache write below. On a growing context the early tokens are dense (topk_blk >= n_blocks); returning
-    // here would skip their index-key write, so once n_kv later crosses the block budget the sparse scoring
-    // reads uninitialised (zero) cache cells for those positions and the block-max-pool/top-k drops genuinely
-    // attended blocks (PPL collapse). So always compute + write the index keys first, then early-out. (index_q
-    // below is only expanded into the graph on the sparse path, so the dense case still computes just index_k.)
-    // Two separate reasons to take the dense path, deliberately NOT folded into one comparison.
+    // Dense fallback, two independent reasons:
+    //   (a) the budget covers every block, so MSA == dense and selection is pure cost;
+    //   (b) --msa-min-kv N, below which the sparse path is a measured net loss (off by default,
+    //       no portable default: the crossover depends on memory bandwidth and core count).
+    // (b) attends a superset of the reference selection, trading fidelity for speed.
     //
-    // (a) The no-op-exact condition above: the budget covers every block, so MSA == dense and the
-    //     selection would be pure cost. Always on, not a user choice.
-    //
-    // (b) --msa-min-kv N: below n_kv = N the sparse path is a measured net LOSS on this hardware,
-    //     so run dense and skip the selection. This attends a SUPERSET of the reference selection,
-    //     trading reference fidelity for speed, which is why it is off by default (N = 0).
-    //     N is an absolute KV count because that is the quantity the crossover is a function of.
-    //     It replaces --msa-dense-frac, which took a fraction of the block budget: with topk_blk
-    //     fixed, that was the same threshold expressed in units nobody could reason about (a ~23k
-    //     switch needed -msadf 0.0889). There is NO portable default -- the crossover depends on
-    //     the machine's memory bandwidth and core count, and on this box it is ~23k.
-    //
-    // Note (b) cannot recover the whole sparse penalty and is not meant to: the index-key cache
-    // write above runs unconditionally, because skipping it rots the cache (see the comment on the
-    // early-out). Measured on a dual Xeon 8260 at n_kv 2,240, the fallback costs ~12% against pure
-    // dense -- that residue IS the key write.
+    // This early-out MUST stay below the index-key cache write above. Early tokens on a growing
+    // context are dense, so returning before the write leaves their cache cells uninitialised;
+    // once n_kv crosses the block budget the scoring reads zeros and top-k drops genuinely
+    // attended blocks, which collapses PPL. The unconditional write is also why the fallback
+    // recovers only part of the penalty (~12% residue against pure dense at n_kv 2,240).
     const bool msa_dense = (topk_blk >= n_blocks)
                         || (cparams.msa_min_kv > 0 && n_kv_eff < (int64_t) cparams.msa_min_kv);
 
