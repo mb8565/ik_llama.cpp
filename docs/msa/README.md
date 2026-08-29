@@ -22,8 +22,8 @@ llama-server -m <MiniMax-M3 GGUF> --msa --msa-gather -c 65536 -t 48 -fa 1 -ngl 0
   without it. This is a MiniMax-M3 template requirement, not an MSA one, but it is the first thing
   a new tester hits.
 - `--msa-min-kv N` runs dense while the cache is smaller than N and sparse at or above it, so you
-  can avoid the below-crossover loss. The crossover is machine-specific — measure yours; on a dual
-  Xeon 8260 it is around 23,000.
+  can avoid the below-crossover loss. The crossover is machine-specific AND phase-dependent — measure yours; on a dual
+  Xeon 8260 decode's is around 23,000 and prefill's is lower. See *Where it wins and loses*.
 - `--msa-gather` falls back to the mask path for tensor-parallel attention, `-fa 0`, an `n_kv` that
   is not a multiple of the block size, and any model whose head counts do not divide.
 
@@ -36,9 +36,16 @@ Check for the indexer in your conversion if you see no change.
 
 ## Where it wins and loses
 
-- **Net loss below about 16k.** Prefill is ~7% slower at 4k-8k and decode is 0.79x at 16k. The
-  indexer scores every cached token on every decoded token; that cost is smaller than dense's but
-  it is not zero, which is why the curves cross rather than the sparse path dominating everywhere.
+- **The crossover is phase-dependent, and quoting one number for both phases is wrong.** Decode
+  crosses around 23,000 KV on this box (0.79x at 16k). Prefill crosses lower: ~7% slower at 4k-8k,
+  but already ahead by 16.5k (43.67 dense vs 46.80 sparse t/s) and 1.42x by 33k. Those prefill
+  figures are PRE-REBASE and have not been re-measured. The indexer scores every cached token on
+  every decoded token; that cost is smaller than dense's but not zero, which is why the curves
+  cross rather than the sparse path dominating everywhere.
+- **`--msa-min-kv N` applies ONE threshold to BOTH phases.** Setting it at decode's crossover also
+  forces prefill dense the whole way up to N, which cost ~15% prefill on a 33k prompt (also
+  PRE-REBASE, same source as the prefill figures above). There is no
+  separate prefill threshold on this branch.
 - **No help on hybrid GPU.** With 8 of 61 layers on four P100s, dense reaches 53.37 t/s prefill and
   every MSA arm lands between 30 and 34. MSA nearly doubles backend graph splits (1410 vs 774) and
   every split is a synchronisation. Use dense there.
@@ -71,12 +78,18 @@ offload), `npp 16384`, `-ub 512`, `-t 48`, arms interleaved in one session on on
 
 | change | phase | effect | control |
 |---|---|---:|---|
-| `pool_1d` threading | prefill | **+27.95%** | dense control −0.58%; greedy output bit-identical (42,118 bytes, same sha256) |
-| CPU-FA kvsplit | decode | **+20.85%** | null control at `-t 16`, where the guard provably cannot fire, came out equal (−0.76%) |
+| `pool_1d` threading | prefill | **+27.95%** | dense control (`-npp 16384 -ntg 32`, the op is absent from that graph) −0.58%; greedy output bit-identical (42,118 bytes, same sha256) |
+| CPU-FA kvsplit | decode | **+20.85%** | null control (`-npp 2048 -c 4096`) at `-t 16`, where the guard provably cannot fire, came out equal (−0.76%) |
 | both together (2x2 factorial) | — | prefill **+26.95%**, decode **+21.26%** vs neither | interaction −1.09pp / −1.38pp, i.e. inside the prefill noise |
 
 The 2x2 headline is *both patches versus neither*. Within that experiment kvsplit's own simple
 effect is +18.54% (pool_1d on) and +19.92% (pool_1d off).
+
+**Every arm above came from an uncommitted bench-only env toggle** (`IK_POOL1D_SERIAL`,
+`IK_KVSPLIT_OFF`) so that one binary provides both A/B arms. The toggle is deliberately NOT on this
+branch, so a checkout gives you the patched arm only, not an A/B. The two controls also came from
+their own runs on other branches at build 4907, not from the 2x2's build 4908; their regimes are
+stated with each control above.
 
 ### Earlier tables (PRE-REBASE — do not compare against the above)
 
