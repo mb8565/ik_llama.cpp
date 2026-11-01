@@ -132,7 +132,7 @@ bool iqk_fa_indexed_kv_heads_rows(int int_type_k, int int_type_v, int Dk, int Dv
     for (int u = u_first; u < u_last; ++u) {
         const int iq = u/nek2, g = u - iq*nek2;
         auto ig = (const int *)(idx + iq*idx_nb2 + g*idx_nb1);
-        auto M  = (const ggml_fp16_t *)((const char *)mask + iq*stride_m);
+        auto M  = (const ggml_fp16_t *)((const char *)mask + size_t(iq)*stride_m);
         for (int j = 0; j < nkv; ++j) {
             std::memcpy(work_k + row_size_k*j, k + g*nbk2 + size_t(ig[j])*stride_k, row_size_k);
             std::memcpy(work_v + row_size_v*j, v + g*nbv2 + size_t(ig[j])*stride_v, row_size_v);
