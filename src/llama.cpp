@@ -939,8 +939,8 @@ int llama_context::max_nodes(int n_tokens, int n_kv) const {
     int max_nodes = model.max_nodes(n_tokens);
     max_nodes += llama_openpangu_chunked_graph_nodes(model, cparams, n_tokens, n_kv);
     if (model.arch == LLM_ARCH_MINIMAX_M3 && !kv_self.kr_l.empty()) {
-        // build_minimaxm3 scores each MINIMAXM3_MSA_SCORE_CHUNK query rows separately, 15 nodes per chunk and layer
-        max_nodes += 15*model.hparams.n_layer*((n_tokens + MINIMAXM3_MSA_SCORE_CHUNK - 1)/MINIMAXM3_MSA_SCORE_CHUNK);
+        // build_minimaxm3 scores each MINIMAXM3_MSA_SCORE_CHUNK query rows separately, 16 nodes per chunk and layer
+        max_nodes += 16*model.hparams.n_layer*((n_tokens + MINIMAXM3_MSA_SCORE_CHUNK - 1)/MINIMAXM3_MSA_SCORE_CHUNK);
     }
     if (model.arch == LLM_ARCH_DEEPSEEK41 && n_tokens > 0 && n_kv > 0) {
         const llama_hparams & hp = model.hparams;

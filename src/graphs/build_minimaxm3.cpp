@@ -51,7 +51,8 @@ static ggml_tensor * minimaxm3_msa_cells(llm_build_context & bctx, ggml_cgraph *
             return nr == n_tokens ? x : ggml_view_3d(ctx0, x, x->ne[0], x->ne[1], nr, x->nb[1], x->nb[2], r0*x->nb[2]);
         };
         ggml_tensor * score = ggml_mul_mat(ctx0, kr, rows(q));
-        score = ggml_add(ctx0, ggml_reshape_3d(ctx0, score, block, n_blocks*n_head, nr), rows(causal));
+        score = ggml_add(ctx0, ggml_reshape_3d(ctx0, score, block, n_blocks*n_head, nr),
+                ggml_cast(ctx0, rows(causal), GGML_TYPE_F32));
         score = ggml_pool_1d(ctx0, ggml_reshape_3d(ctx0, score, block, n_blocks, n_head*nr), GGML_OP_POOL_MAX, block, block, 0);
         score = ggml_reshape_3d(ctx0, score, n_blocks, n_head, nr);
         bctx.cb(score, "msa_blk_scores", il);
@@ -95,7 +96,7 @@ ggml_cgraph* llm_build_context::build_minimaxm3() {
         ggml_set_input(lctx.inp_msa_cells);
         ggml_set_input(lctx.inp_msa_bias);
         // a future cell must not win the max of its block
-        msa_causal = ggml_cast(ctx0, ggml_view_2d(ctx0, KQ_mask, n_kv, n_tokens, KQ_mask->nb[1], 0), GGML_TYPE_F32);
+        msa_causal = ggml_view_2d(ctx0, KQ_mask, n_kv, n_tokens, KQ_mask->nb[1], 0);
         msa_causal = ggml_reshape_3d(ctx0, msa_causal, block, n_kv/block, n_tokens);
     }
 
