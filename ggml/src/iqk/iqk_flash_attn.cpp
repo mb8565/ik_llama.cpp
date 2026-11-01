@@ -128,29 +128,17 @@ bool iqk_fa_indexed_kv_heads_rows(int int_type_k, int int_type_v, int Dk, int Dv
     auto work_k = work + size_t(ith)*(row_size_k + row_size_v + 64)*nkv;
     auto work_v = work_k + row_size_k*nkv;
     auto work_m = (ggml_fp16_t *)(work_v + row_size_v*nkv);
-    const ggml_fp16_t h_inf = ggml_fp32_to_fp16(-INFINITY);
 
     for (int u = u_first; u < u_last; ++u) {
         const int iq = u/nek2, g = u - iq*nek2;
         auto ig = (const int *)(idx + iq*idx_nb2 + g*idx_nb1);
         auto M  = (const ggml_fp16_t *)((const char *)mask + iq*stride_m);
-        int last_found = -1;
         for (int j = 0; j < nkv; ++j) {
-            if (ig[j] >= 0) {
-                std::memcpy(work_k + row_size_k*j, k + g*nbk2 + size_t(ig[j])*stride_k, row_size_k);
-                std::memcpy(work_v + row_size_v*j, v + g*nbv2 + size_t(ig[j])*stride_v, row_size_v);
-                work_m[j] = M[ig[j]];
-                last_found = j;
-            } else {
-                std::memset(work_k + row_size_k*j, 0, row_size_k);
-                std::memset(work_v + row_size_v*j, 0, row_size_v);
-                work_m[j] = h_inf;
-            }
+            std::memcpy(work_k + row_size_k*j, k + g*nbk2 + size_t(ig[j])*stride_k, row_size_k);
+            std::memcpy(work_v + row_size_v*j, v + g*nbv2 + size_t(ig[j])*stride_v, row_size_v);
+            work_m[j] = M[ig[j]];
         }
-        if (last_found < 0) continue;
-        ++last_found;
-        int this_nkv = 32*((last_found + 31)/32);
-        if (!iqk_flash_attn_impl(int_type_k, int_type_v, Dk, Dv, rk2, this_nkv, nbq2, row_size_k, row_size_v, 0, Dv,
+        if (!iqk_flash_attn_impl(int_type_k, int_type_v, Dk, Dv, rk2, nkv, nbq2, row_size_k, row_size_v, 0, Dv,
                  (const float *)(q + iq*stride_q + g*rk2*nbq2), work_k, work_v, work_m, sinks ? sinks + g*rk2 : nullptr, 1,
                  scale, softcap, qkv + (size_t(iq)*ne1 + g*rk2)*nb1/sizeof(float), nullptr, nullptr)) return false;
     }
